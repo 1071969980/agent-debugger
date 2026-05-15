@@ -1,15 +1,19 @@
-/** Background daemon — holds the DAP session, accepts CLI commands via Unix socket. */
+/** Background daemon — holds multiple DAP sessions, accepts CLI commands via Unix socket. */
 
 import { createServer, type Server, type Socket } from "node:net";
 import { mkdirSync, writeFileSync, unlinkSync, existsSync } from "node:fs";
-import { SESSION_DIR, SOCKET_PATH, PID_FILE } from "./util/paths.js";
+import { SESSION_DIR, SOCKET_PATH, PID_FILE, generateSessionId } from "./util/paths.js";
 import { Session } from "./session.js";
-import { Command } from "./protocol.js";
+import { Command, type CommandResult, type SessionInfo } from "./protocol.js";
 
 class Daemon {
-  private session = new Session();
+  private sessions = new Map<string, Session>();
+  /** Track which PID each session has attached to, to prevent double-attach. */
+  private pidMap = new Map<number, string>(); // pid → sessionId
   private server: Server | null = null;
   private isShuttingDown = false;
+  /** Per-session command serialization queue. */
+  private sessionQueues = new Map<string, Promise<CommandResult>>();
 
   start(): void {
     mkdirSync(SESSION_DIR, { recursive: true });
@@ -26,6 +30,9 @@ class Daemon {
     this.server = createServer((conn) => { this.handleConnection(conn); });
     this.server.listen(SOCKET_PATH);
 
+    // Auto-cleanup terminated sessions every 60 seconds
+    setInterval(() => this.cleanupTerminated(), 60_000).unref();
+
     // Graceful shutdown
     const shutdown = (signal: string) => {
       if (this.isShuttingDown) return;
@@ -36,7 +43,6 @@ class Daemon {
 
     process.on("SIGTERM", () => {
       shutdown("SIGTERM");
-      // Force exit after 5s if cleanup hangs
       setTimeout(() => process.exit(1), 5_000).unref();
     });
     process.on("SIGINT", () => {
@@ -57,14 +63,13 @@ class Daemon {
       if (processed) return;
       data += chunk.toString();
 
-      // Try to parse as JSON (newline-delimited or complete)
       const nlIdx = data.indexOf("\n");
       const toParse = nlIdx !== -1 ? data.substring(0, nlIdx) : data;
 
       try {
-        const cmd = JSON.parse(toParse) as Record<string, unknown>;
+        const raw = JSON.parse(toParse) as Record<string, unknown>;
         processed = true;
-        this.processCommand(cmd, conn);
+        this.processRawCommand(raw, conn);
       } catch {
         // Wait for more data
       }
@@ -73,9 +78,9 @@ class Daemon {
     conn.on("end", () => {
       if (!processed && data.trim()) {
         try {
-          const cmd = JSON.parse(data.trim()) as Record<string, unknown>;
+          const raw = JSON.parse(data.trim()) as Record<string, unknown>;
           processed = true;
-          this.processCommand(cmd, conn);
+          this.processRawCommand(raw, conn);
         } catch {
           this.sendResponse(conn, { error: "Invalid JSON" });
         }
@@ -87,33 +92,204 @@ class Daemon {
     });
   }
 
-  private async processCommand(rawCmd: Record<string, unknown>, conn: Socket): Promise<void> {
+  /**
+   * Accept both old-style commands (flat JSON with `action`) and
+   * new-style envelopes (`{ session_id, command: { action, ... } }`).
+   */
+  private async processRawCommand(raw: Record<string, unknown>, conn: Socket): Promise<void> {
     try {
-      const parsed = Command.safeParse(rawCmd);
+      let sessionId: string | undefined;
+      let cmdObj: Record<string, unknown>;
+
+      if (raw.action) {
+        // Old-style flat command (backward compatible)
+        cmdObj = raw;
+      } else if (raw.command && typeof raw.command === "object") {
+        // New-style envelope
+        const envelope = raw as { session_id?: string; command: Record<string, unknown> };
+        sessionId = envelope.session_id;
+        cmdObj = envelope.command;
+      } else {
+        this.sendResponse(conn, { error: "Invalid command: must have 'action' or 'command'" });
+        return;
+      }
+
+      const parsed = Command.safeParse(cmdObj);
       if (!parsed.success) {
         this.sendResponse(conn, { error: `Invalid command: ${parsed.error.message}` });
         return;
       }
 
       const cmd = parsed.data;
+      let result: CommandResult;
 
-      // Special handling for status command (needs async location)
-      let result;
-      if (cmd.action === "status") {
-        result = await this.session.getStatusAsync();
-      } else {
-        result = await this.session.handleCommand(cmd);
+      switch (cmd.action) {
+        case "list":
+          result = this.listSessions();
+          break;
+        case "shutdown":
+          this.sendResponse(conn, { status: "shutdown" });
+          setTimeout(() => this.cleanup(), 100);
+          return;
+        case "start":
+          result = await this.handleStart(cmd);
+          break;
+        case "attach":
+          result = await this.handleAttach(cmd, sessionId);
+          break;
+        case "close": {
+          const targetId = sessionId ?? this.resolveSingleSession();
+          if (!targetId) {
+            result = { error: "No active session" };
+          } else {
+            result = await this.enqueueCommand(targetId, cmd);
+            if (!result.error) {
+              this.removeSession(targetId);
+            }
+          }
+          break;
+        }
+        default: {
+          const id = sessionId ?? this.resolveSingleSession();
+          if (!id) {
+            result = { error: "No active session. Start or attach first." };
+          } else {
+            result = await this.enqueueCommand(id, cmd);
+            // Auto-cleanup terminated sessions
+            const session = this.sessions.get(id);
+            if (session && session.state === "terminated") {
+              this.removeSession(id);
+            }
+          }
+        }
       }
 
       this.sendResponse(conn, result as unknown as Record<string, unknown>);
-
-      // Self-terminate on close
-      if (cmd.action === "close") {
-        setTimeout(() => this.cleanup(), 100);
-      }
     } catch (err) {
       this.sendResponse(conn, { error: (err as Error).message });
     }
+  }
+
+  private async handleStart(cmd: Extract<Command, { action: "start" }>): Promise<CommandResult> {
+    const sessionId = generateSessionId();
+    const session = new Session();
+    const result = await this.enqueueCommand(sessionId, cmd, session);
+
+    if (result.error) {
+      return result;
+    }
+
+    this.sessions.set(sessionId, session);
+    result.session_id = sessionId;
+    return result;
+  }
+
+  private async handleAttach(cmd: Extract<Command, { action: "attach" }>, _sessionId?: string): Promise<CommandResult> {
+    // PID dedup: prevent double-attach to same PID
+    if (cmd.pid) {
+      const existingId = this.pidMap.get(cmd.pid);
+      if (existingId) {
+        const existing = this.sessions.get(existingId);
+        if (existing && existing.state !== "terminated") {
+          return { error: `PID ${cmd.pid} already has an active session (${existingId})` };
+        }
+        this.pidMap.delete(cmd.pid);
+      }
+    }
+
+    const sessionId = generateSessionId();
+    const session = new Session();
+    const result = await this.enqueueCommand(sessionId, cmd, session);
+
+    if (result.error) {
+      return result;
+    }
+
+    this.sessions.set(sessionId, session);
+    if (cmd.pid) {
+      this.pidMap.set(cmd.pid, sessionId);
+    }
+    result.session_id = sessionId;
+    return result;
+  }
+
+  /**
+   * Serialize commands per session to prevent concurrent DAP state corruption.
+   * Each session has a Promise chain; new commands are appended to it.
+   */
+  private enqueueCommand(
+    sessionId: string,
+    cmd: Command,
+    session?: Session,
+  ): Promise<CommandResult> {
+    const s = session ?? this.sessions.get(sessionId);
+    if (!s) {
+      return Promise.resolve({ error: `Session not found: ${sessionId}` });
+    }
+
+    const prev = this.sessionQueues.get(sessionId) ?? Promise.resolve({} as CommandResult);
+    const next = prev.then(async () => {
+      if (cmd.action === "start" || cmd.action === "attach") {
+        return s.handleCommand(cmd);
+      }
+      if (cmd.action === "status") {
+        return s.getStatusAsync();
+      }
+      return s.handleCommand(cmd);
+    });
+
+    this.sessionQueues.set(sessionId, next.catch((err) => ({
+      error: `Session ${sessionId} error: ${(err as Error).message}`,
+    })));
+
+    return next;
+  }
+
+  private removeSession(sessionId: string): void {
+    this.sessions.delete(sessionId);
+    this.sessionQueues.delete(sessionId);
+    // Clean up PID mapping
+    for (const [pid, id] of this.pidMap) {
+      if (id === sessionId) {
+        this.pidMap.delete(pid);
+      }
+    }
+  }
+
+  /**
+   * For backward compatibility: if there's exactly one session, use it;
+   * if there are multiple, require an explicit session_id.
+   */
+  private resolveSingleSession(): string | undefined {
+    const active = Array.from(this.sessions.entries())
+      .filter(([, s]) => s.state !== "terminated");
+
+    if (active.length === 0) return undefined;
+    if (active.length === 1) return active[0]![0];
+
+    // Multiple sessions — ambiguous
+    return undefined;
+  }
+
+  /** Remove terminated sessions to prevent memory leaks. */
+  private cleanupTerminated(): void {
+    for (const [id, session] of this.sessions) {
+      if (session.state === "terminated") {
+        this.removeSession(id);
+      }
+    }
+  }
+
+  private listSessions(): CommandResult {
+    const sessions: SessionInfo[] = [];
+    for (const [id, session] of this.sessions) {
+      sessions.push({
+        session_id: id,
+        state: session.state,
+        script: session.scriptPath ?? undefined,
+      });
+    }
+    return { sessions, count: sessions.length };
   }
 
   private sendResponse(conn: Socket, result: Record<string, unknown>): void {
@@ -126,7 +302,10 @@ class Daemon {
   }
 
   private cleanup(): void {
-    this.session.close().catch(() => {});
+    for (const [, session] of this.sessions) {
+      session.close().catch(() => {});
+    }
+    this.sessions.clear();
 
     if (this.server) {
       this.server.close();

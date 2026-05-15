@@ -68,7 +68,31 @@ agent-debugger close          # detaches without killing the server
 | `break <file:line[:condition]>` | Add a breakpoint mid-session |
 | `source [file] [line]` | Show source code around the current line |
 | `status` | Show session state and current location |
-| `close` | Detach or end the debug session |
+| `close` | Close the current debug session |
+| `list` | List all active debug sessions |
+| `shutdown` | Shut down the daemon |
+
+### Session Targeting
+
+Multiple debug sessions can run concurrently. Use `--session <id>` to target a specific session:
+
+```bash
+# Start two sessions
+agent-debugger start app.py --break app.py:10     # returns session_id "a1b2c3d4"
+agent-debugger start worker.py --break worker.py:5 # returns session_id "e5f6g7h8"
+
+# List all active sessions
+agent-debugger list
+
+# Target a specific session
+agent-debugger --session a1b2c3d4 vars
+agent-debugger --session e5f6g7h8 step
+
+# Close one session
+agent-debugger --session a1b2c3d4 close
+```
+
+When only one session exists, it is targeted automatically. When multiple sessions exist, `--session` is required.
 
 ### Start Options
 
@@ -211,4 +235,4 @@ CLI  ──unix socket──▶  Daemon  ──TCP/DAP──▶  Your Server
 - **Daemon**: Background process that manages the debug session. Spawns, injects, or connects to a debug adapter via DAP, and translates CLI commands into DAP requests.
 - **Debug Adapter**: Language-specific process (debugpy, Delve, js-debug, CodeLLDB) that implements the Debug Adapter Protocol.
 
-The daemon starts automatically on the first command and shuts down when the session closes. Only one debug session runs at a time.
+The daemon starts automatically on the first command. Multiple debug sessions can run concurrently. Use `agent-debugger shutdown` to stop the daemon.

@@ -2,6 +2,16 @@
 
 import { z } from "zod";
 
+// --- Envelope ---
+
+/** Multi-session envelope: wraps a command with a session ID. */
+export const Envelope = z.object({
+  session_id: z.string().optional(),
+  command: z.record(z.unknown()),
+});
+
+export type Envelope = z.infer<typeof Envelope>;
+
 // --- Commands (CLI -> Daemon) ---
 
 export const StartCommand = z.object({
@@ -9,6 +19,7 @@ export const StartCommand = z.object({
   script: z.string(),
   language: z.string().optional(),
   breakpoints: z.array(z.string()).optional(),
+  exception_filters: z.array(z.string()).optional(),
   runtime: z.string().optional(),
   args: z.array(z.string()).optional(),
   cwd: z.string().optional(),
@@ -55,6 +66,8 @@ export const SourceCommand = z.object({
 
 export const StatusCommand = z.object({ action: z.literal("status") });
 export const CloseCommand = z.object({ action: z.literal("close") });
+export const ListCommand = z.object({ action: z.literal("list") });
+export const ShutdownCommand = z.object({ action: z.literal("shutdown") });
 
 export const Command = z.discriminatedUnion("action", [
   StartCommand,
@@ -68,6 +81,8 @@ export const Command = z.discriminatedUnion("action", [
   SourceCommand,
   StatusCommand,
   CloseCommand,
+  ListCommand,
+  ShutdownCommand,
 ]);
 
 export type Command = z.infer<typeof Command>;
@@ -92,10 +107,18 @@ export interface VariableInfo {
   type: string;
 }
 
+export interface SessionInfo {
+  session_id: string;
+  state: string;
+  script?: string;
+  pid?: number;
+}
+
 export interface CommandResult {
   error?: string;
   status?: string;
   reason?: string;
+  session_id?: string;
   location?: LocationInfo | null;
   breakpoints?: BreakpointInfo[];
   variables?: VariableInfo[];
@@ -110,4 +133,5 @@ export interface CommandResult {
   verified?: boolean;
   state?: string;
   message?: string;
+  sessions?: SessionInfo[];
 }

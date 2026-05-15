@@ -17,7 +17,9 @@ export class Session {
   private adapterProcess: ChildProcess | null = null;
   private threadId: number | null = null;
   private frameId: number | null = null;
-  private scriptPath: string | null = null;
+  private _scriptPath: string | null = null;
+  /** Path of the debugged script (set in launch mode). */
+  get scriptPath(): string | null { return this._scriptPath; }
   /** True when connected via attach (don't kill the debuggee on close). */
   private attachedMode = false;
 
@@ -45,6 +47,9 @@ export class Session {
         return this.getStatus();
       case "close":
         return this.close();
+      case "list":
+      case "shutdown":
+        return { error: `Action '${cmd.action}' is handled by the daemon, not a session` };
     }
   }
 
@@ -54,7 +59,7 @@ export class Session {
     }
 
     const script = pathResolve(cmd.script);
-    this.scriptPath = script;
+    this._scriptPath = script;
     this.state = "starting";
 
     // Detect language and get adapter
@@ -499,7 +504,7 @@ export class Session {
     this.state = "idle";
     this.threadId = null;
     this.frameId = null;
-    this.scriptPath = null;
+    this._scriptPath = null;
     this.attachedMode = false;
     return { status: "closed" };
   }

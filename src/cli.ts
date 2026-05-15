@@ -56,7 +56,10 @@ function ensureDaemon(): Promise<void> {
   });
 }
 
-function sendCommand(cmd: Record<string, unknown>): Promise<CommandResult> {
+function sendCommand(
+  cmd: Record<string, unknown>,
+  sessionId?: string,
+): Promise<CommandResult> {
   return new Promise(async (resolve, reject) => {
     try {
       await ensureDaemon();
@@ -65,11 +68,16 @@ function sendCommand(cmd: Record<string, unknown>): Promise<CommandResult> {
       return;
     }
 
+    // Build envelope or flat command
+    const payload = sessionId
+      ? { session_id: sessionId, command: cmd }
+      : cmd;
+
     const sock: Socket = connect(SOCKET_PATH);
     let data = "";
 
     sock.on("connect", () => {
-      sock.write(JSON.stringify(cmd) + "\n");
+      sock.write(JSON.stringify(payload) + "\n");
     });
 
     sock.on("data", (chunk) => {
@@ -101,6 +109,19 @@ function sendCommand(cmd: Record<string, unknown>): Promise<CommandResult> {
 function formatResult(result: CommandResult): string {
   if (result.error) {
     return `Error: ${result.error}`;
+  }
+
+  // Session list
+  if (result.sessions) {
+    if (!result.sessions.length) {
+      return "  No active sessions.";
+    }
+    const lines: string[] = [];
+    for (const s of result.sessions) {
+      const script = s.script ? `  script: ${s.script}` : "";
+      lines.push(`  ${s.session_id}  state: ${s.state}${script}`);
+    }
+    return lines.join("\n");
   }
 
   // Variables
@@ -200,6 +221,11 @@ function formatResult(result: CommandResult): string {
     return "Session closed.";
   }
 
+  // Shutdown
+  if (result.status === "shutdown") {
+    return "Daemon shut down.";
+  }
+
   // Generic
   return JSON.stringify(result, null, 2);
 }
@@ -217,21 +243,56 @@ Usage:
   agent-debugger stack                       Show call stack
   agent-debugger break <file:line[:cond]>    Add breakpoint
   agent-debugger source [file] [line]        Show source code
-  agent-debugger status                      Show current state
-  agent-debugger close                       Detach / end debug session`;
+  agent-debugger status                      Show session state
+  agent-debugger close                       Close a debug session
+  agent-debugger list                        List all active sessions
+  agent-debugger shutdown                    Shut down the daemon
+
+Session targeting:
+  --session <id>       Target a specific session
+                      When only one session exists, it is used automatically.
+                      When multiple sessions exist, --session is required.`;
+
+/** Extract --session <id> from args and return remaining args. */
+function extractSessionId(args: string[]): { sessionId?: string; rest: string[] } {
+  const rest: string[] = [];
+  let sessionId: string | undefined;
+
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--session" && i + 1 < args.length) {
+      sessionId = args[i + 1];
+      i++; // skip value
+    } else {
+      rest.push(args[i]!);
+    }
+  }
+
+  return { sessionId, rest };
+}
 
 async function main(): Promise<void> {
-  const args = process.argv.slice(2);
+  const rawArgs = process.argv.slice(2);
 
-  if (!args.length || args[0] === "-h" || args[0] === "--help" || args[0] === "help") {
+  if (!rawArgs.length || rawArgs[0] === "-h" || rawArgs[0] === "--help" || rawArgs[0] === "help") {
     console.log(HELP);
     return;
   }
+
+  // Extract --session flag globally
+  const { sessionId: cliSessionId, rest: args } = extractSessionId(rawArgs);
 
   const command = args[0]!;
   let result: CommandResult;
 
   switch (command) {
+    case "list":
+      result = await sendCommand({ action: "list" });
+      break;
+
+    case "shutdown":
+      result = await sendCommand({ action: "shutdown" });
+      break;
+
     case "start": {
       if (args.length < 2) {
         process.stderr.write("Error: missing script path. Usage: agent-debugger start <script>\n");
@@ -339,70 +400,67 @@ async function main(): Promise<void> {
       break;
     }
 
-    case "vars":
-      result = await sendCommand({ action: "vars" });
-      break;
-
-    case "eval": {
-      const expr = args.slice(1).join(" ");
-      if (!expr) {
-        process.stderr.write("Error: missing expression. Usage: agent-debugger eval <expression>\n");
-        process.exit(1);
-      }
-      result = await sendCommand({ action: "eval", expression: expr });
+    case "close": {
+      result = await sendCommand({ action: "close" }, cliSessionId);
       break;
     }
 
+    case "vars":
+    case "eval":
     case "step":
-      result = await sendCommand({ action: "step", kind: args[1] || "over" });
-      break;
-
     case "continue":
     case "cont":
     case "c":
-      result = await sendCommand({ action: "continue" });
-      break;
-
     case "stack":
-      result = await sendCommand({ action: "stack" });
-      break;
-
     case "break":
-    case "bp": {
-      if (args.length < 2) {
-        process.stderr.write("Error: missing location. Usage: agent-debugger break <file:line[:condition]>\n");
-        process.exit(1);
+    case "bp":
+    case "source":
+    case "status": {
+      const sid = cliSessionId; // no file fallback — purely stateless
+
+      if (command === "eval") {
+        const expr = args.slice(1).join(" ");
+        if (!expr) {
+          process.stderr.write("Error: missing expression. Usage: agent-debugger eval <expression>\n");
+          process.exit(1);
+        }
+        result = await sendCommand({ action: "eval", expression: expr }, sid);
+      } else if (command === "step") {
+        result = await sendCommand({ action: "step", kind: args[1] || "over" }, sid);
+      } else if (command === "continue" || command === "cont" || command === "c") {
+        result = await sendCommand({ action: "continue" }, sid);
+      } else if (command === "break" || command === "bp") {
+        if (args.length < 2) {
+          process.stderr.write("Error: missing location. Usage: agent-debugger break <file:line[:condition]>\n");
+          process.exit(1);
+        }
+        const parts = args[1]!.split(":");
+        if (parts.length < 2) {
+          process.stderr.write("Error: invalid breakpoint format. Use file:line or file:line:condition\n");
+          process.exit(1);
+        }
+        const bpCmd: Record<string, unknown> = {
+          action: "break",
+          file: parts[0]!,
+          line: parseInt(parts[1]!, 10),
+        };
+        if (parts.length > 2) bpCmd.condition = parts.slice(2).join(":");
+        result = await sendCommand(bpCmd, sid);
+      } else if (command === "source") {
+        const srcCmd: Record<string, unknown> = { action: "source" };
+        if (args.length > 1) srcCmd.file = args[1]!;
+        if (args.length > 2) srcCmd.line = parseInt(args[2]!, 10);
+        result = await sendCommand(srcCmd, sid);
+      } else if (command === "vars") {
+        result = await sendCommand({ action: "vars" }, sid);
+      } else if (command === "stack") {
+        result = await sendCommand({ action: "stack" }, sid);
+      } else {
+        // status
+        result = await sendCommand({ action: "status" }, sid);
       }
-      const parts = args[1]!.split(":");
-      if (parts.length < 2) {
-        process.stderr.write("Error: invalid breakpoint format. Use file:line or file:line:condition\n");
-        process.exit(1);
-      }
-      const cmd: Record<string, unknown> = {
-        action: "break",
-        file: parts[0]!,
-        line: parseInt(parts[1]!, 10),
-      };
-      if (parts.length > 2) cmd.condition = parts.slice(2).join(":");
-      result = await sendCommand(cmd);
       break;
     }
-
-    case "source": {
-      const cmd: Record<string, unknown> = { action: "source" };
-      if (args.length > 1) cmd.file = args[1]!;
-      if (args.length > 2) cmd.line = parseInt(args[2]!, 10);
-      result = await sendCommand(cmd);
-      break;
-    }
-
-    case "status":
-      result = await sendCommand({ action: "status" });
-      break;
-
-    case "close":
-      result = await sendCommand({ action: "close" });
-      break;
 
     default:
       process.stderr.write(`Unknown command: ${command}. Run 'agent-debugger --help' for usage.\n`);

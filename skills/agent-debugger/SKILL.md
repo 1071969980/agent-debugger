@@ -34,7 +34,7 @@ The debugger is a scalpel, not a flashlight. You don't turn it on to look around
 
 7. **Prove the fix, write the test.** After fixing, re-run the program to verify. Then write the smallest possible test that catches the bug. A fix without a test is a fix that will regress.
 
-8. **Close the session.** Always. A stale session blocks the next one.
+8. **Close the session.** Always. `close` when done. Multiple sessions can coexist, but don't leave stale ones around.
 
 ## Bootstrap
 
@@ -59,7 +59,20 @@ agent-debugger stack                    # Show call stack
 agent-debugger break file:line[:cond]   # Add breakpoint mid-session
 agent-debugger source                   # Show source around current line
 agent-debugger status                   # Show session state and location
-agent-debugger close                    # Detach / end debug session
+agent-debugger close                    # Close a debug session
+agent-debugger list                     # List all active sessions
+agent-debugger shutdown                 # Shut down the daemon
+```
+
+Multiple sessions are supported. When only one session exists, commands target it automatically. When multiple sessions exist, use `--session <id>`:
+
+```bash
+agent-debugger start app.py --break app.py:10      # returns session_id "a1b2c3d4"
+agent-debugger start worker.py --break worker.py:5  # returns session_id "e5f6g7h8"
+agent-debugger list                                  # show all sessions
+agent-debugger --session a1b2c3d4 vars               # target specific session
+agent-debugger --session a1b2c3d4 close              # close one session
+agent-debugger shutdown                              # stop the daemon
 ```
 
 Multiple `--break` flags supported. Conditions are expressions: `--break "app.py:42:len(items) > 10"`.
@@ -279,7 +292,8 @@ agent-debugger eval "users[2]"                           # {'name': 'Charlie', '
 ## Notes
 
 - Use **absolute paths** for breakpoints
-- One session at a time — `close` before starting another
+- Multiple sessions supported — use `--session <id>` to target a specific one, or omit it when only one exists
 - `attach --pid` auto-installs debugpy — no manual setup needed
 - `attach --pid` requires lldb (macOS, included with Xcode CLI tools) or gdb (Linux)
 - Program stdout goes to the daemon — use `eval` to inspect output values
+- Use `list` to see all active sessions and their IDs
