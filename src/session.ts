@@ -6,7 +6,7 @@ import type { ChildProcess } from "node:child_process";
 import { DAPClient } from "./dap-client.js";
 import type { AdapterConfig } from "./adapters/base.js";
 import { getAdapterForFile, getAdapter } from "./adapters/registry.js";
-import type { Command, CommandResult, LocationInfo, VariableInfo } from "./protocol.js";
+import type { Command, CommandResult, LocationInfo, VariableInfo, ExceptionDetail } from "./protocol.js";
 
 export type SessionState = "idle" | "starting" | "running" | "paused" | "terminated";
 
@@ -135,6 +135,9 @@ export class Session {
       if (!this.threadId) this.threadId = 1;
       await this.updateFrame();
       result.location = await this.currentLocation();
+      if (result.reason && result.reason !== "breakpoint" && result.reason !== "step") {
+        result.exception = await this.fetchExceptionInfo();
+      }
     } else if (result.status === "terminated") {
       this.state = "terminated";
     } else {
@@ -294,6 +297,36 @@ export class Session {
     return null;
   }
 
+  /** Fetch detailed exception info via DAP exceptionInfo request. */
+  private async fetchExceptionInfo(): Promise<ExceptionDetail | null> {
+    if (!this.client || this.threadId === null) return null;
+    try {
+      const resp = await this.client.request("exceptionInfo", { threadId: this.threadId });
+      if (!resp.success || !resp.body) return null;
+      const body = resp.body as {
+        exceptionId?: string;
+        description?: string;
+        breakMode?: string;
+        details?: {
+          message?: string;
+          typeName?: string;
+          fullTypeName?: string;
+          stackTrace?: string;
+          evaluateName?: string;
+        };
+      };
+      const details = body.details;
+      if (!details) return null;
+      return {
+        typeName: details.typeName || details.fullTypeName || body.exceptionId || "Unknown",
+        description: details.message || body.description || "",
+        stackTrace: details.stackTrace || "",
+      };
+    } catch {
+      return null;
+    }
+  }
+
   private async getVariables(): Promise<CommandResult> {
     if (this.state !== "paused") return { error: "Program is not paused" };
     if (!this.client) return { error: "No active session" };
@@ -414,10 +447,12 @@ export class Session {
         const reason = this.bgStopReason;
         this.bgStopReason = null;
         const loc = await this.currentLocation();
+        const exception = reason !== "breakpoint" ? await this.fetchExceptionInfo() : null;
         return {
           status: "paused",
           reason: reason || "breakpoint",
           location: loc,
+          exception,
         };
       }
       if (this.state === "terminated") {
@@ -434,10 +469,12 @@ export class Session {
         const detail = body.reason === "exception" && body.text
           ? `${body.text}: ${body.description || ""}`.trim()
           : body.reason;
+        const exception = body.reason === "exception" ? await this.fetchExceptionInfo() : null;
         return {
           status: "paused",
           reason: detail || "unknown",
           location: await this.currentLocation(),
+          exception,
         };
       }
 

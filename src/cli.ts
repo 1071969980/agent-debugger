@@ -159,6 +159,15 @@ function formatResult(result: CommandResult): string {
       const reason = result.reason ? ` (${result.reason})` : "";
       out.push(`Status: ${result.status}${reason}`);
     }
+    if (result.exception) {
+      const ex = result.exception;
+      out.push(`Exception: ${ex.typeName}: ${ex.description}`);
+      if (ex.stackTrace) {
+        for (const line of ex.stackTrace.split("\n")) {
+          out.push(`  ${line}`);
+        }
+      }
+    }
     out.push(`  ${loc.file}:${loc.line} in ${loc.function}`);
     if (result.breakpoints) {
       for (const bp of result.breakpoints) {

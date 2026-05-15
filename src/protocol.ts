@@ -115,6 +115,12 @@ export interface SessionInfo {
   pid?: number;
 }
 
+export interface ExceptionDetail {
+  typeName: string;
+  description: string;
+  stackTrace: string;
+}
+
 export interface CommandResult {
   error?: string;
   status?: string;
@@ -135,4 +141,5 @@ export interface CommandResult {
   state?: string;
   message?: string;
   sessions?: SessionInfo[];
+  exception?: ExceptionDetail | null;
 }
