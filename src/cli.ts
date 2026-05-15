@@ -233,9 +233,9 @@ function formatResult(result: CommandResult): string {
 const HELP = `agent-debugger \u2014 CLI debugger for AI agents
 
 Usage:
-  agent-debugger start <script> [--break file:line] [--runtime path] [--args ...]
-  agent-debugger attach --pid <PID> [--break file:line]
-  agent-debugger attach [host:]port [--break file:line]
+  agent-debugger start <script> [--break file:line] [--catch [filter]] [--runtime path] [--args ...]
+  agent-debugger attach --pid <PID> [--break file:line] [--catch [filter]]
+  agent-debugger attach [host:]port [--break file:line] [--catch [filter]]
   agent-debugger vars                        Get local variables
   agent-debugger eval <expression>           Evaluate expression
   agent-debugger step [into|out]             Step over/into/out
@@ -251,7 +251,16 @@ Usage:
 Session targeting:
   --session <id>       Target a specific session
                       When only one session exists, it is used automatically.
-                      When multiple sessions exist, --session is required.`;
+                      When multiple sessions exist, --session is required.
+
+Exception breakpoints:
+  --catch [filter]     Pause on exceptions (repeatable)
+                       No argument = "uncaught" (default)
+                       Filter is passed to the DAP adapter directly.
+                       Python:  raised, uncaught, userUnhandled
+                       Node.js: all, uncaught
+                       Go:      all, uncaught
+                       Rust:    panic`;
 
 /** Extract --session <id> from args and return remaining args. */
 function extractSessionId(args: string[]): { sessionId?: string; rest: string[] } {
@@ -300,6 +309,7 @@ async function main(): Promise<void> {
       }
       const script = args[1]!;
       const breakpoints: string[] = [];
+      const exceptionFilters: string[] = [];
       let runtimePath: string | undefined;
       let scriptArgs: string[] | undefined;
       let stopOnEntry = false;
@@ -309,6 +319,14 @@ async function main(): Promise<void> {
         if ((args[i] === "--break" || args[i] === "-b") && i + 1 < args.length) {
           breakpoints.push(args[i + 1]!);
           i += 2;
+        } else if (args[i] === "--catch") {
+          if (i + 1 < args.length && !args[i + 1]!.startsWith("-")) {
+            exceptionFilters.push(args[i + 1]!);
+            i += 2;
+          } else {
+            exceptionFilters.push("uncaught");
+            i += 1;
+          }
         } else if ((args[i] === "--runtime" || args[i] === "--python") && i + 1 < args.length) {
           runtimePath = args[i + 1]!;
           i += 2;
@@ -334,6 +352,7 @@ async function main(): Promise<void> {
         breakpoints,
         stop_on_entry: stopOnEntry,
       };
+      if (exceptionFilters.length) cmd.exception_filters = exceptionFilters;
       if (runtimePath) cmd.runtime = pathResolve(runtimePath);
       if (scriptArgs) cmd.args = scriptArgs;
       result = await sendCommand(cmd);
@@ -342,6 +361,7 @@ async function main(): Promise<void> {
 
     case "attach": {
       const attachBreakpoints: string[] = [];
+      const attachExceptionFilters: string[] = [];
       let attachHost: string | undefined;
       let attachPort: number | undefined;
       let attachPid: number | undefined;
@@ -353,6 +373,14 @@ async function main(): Promise<void> {
         if ((args[ai] === "--break" || args[ai] === "-b") && ai + 1 < args.length) {
           attachBreakpoints.push(args[ai + 1]!);
           ai += 2;
+        } else if (args[ai] === "--catch") {
+          if (ai + 1 < args.length && !args[ai + 1]!.startsWith("-")) {
+            attachExceptionFilters.push(args[ai + 1]!);
+            ai += 2;
+          } else {
+            attachExceptionFilters.push("uncaught");
+            ai += 1;
+          }
         } else if (args[ai] === "--pid" && ai + 1 < args.length) {
           attachPid = parseInt(args[ai + 1]!, 10);
           ai += 2;
@@ -396,6 +424,7 @@ async function main(): Promise<void> {
       if (attachHost) attachCmd.host = attachHost;
       if (attachLanguage) attachCmd.language = attachLanguage;
       if (attachRuntime) attachCmd.runtime = attachRuntime;
+      if (attachExceptionFilters.length) attachCmd.exception_filters = attachExceptionFilters;
       result = await sendCommand(attachCmd);
       break;
     }

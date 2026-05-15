@@ -22,6 +22,12 @@ export class Session {
   get scriptPath(): string | null { return this._scriptPath; }
   /** True when connected via attach (don't kill the debuggee on close). */
   private attachedMode = false;
+  /** Background event loop handle — monitors for stopped/terminated while running. */
+  private bgLoop: Promise<void> | null = null;
+  /** Flag to signal the background event loop to stop. */
+  private bgLoopAbort = false;
+  /** Stop reason captured by the background event loop, consumed by waitForStop. */
+  private bgStopReason: string | null = null;
 
   async handleCommand(cmd: Command): Promise<CommandResult> {
     switch (cmd.action) {
@@ -111,6 +117,7 @@ export class Session {
       stopOnEntry: cmd.stop_on_entry,
       runtimePath: cmd.runtime,
       breakpoints,
+      exceptionFilters: cmd.exception_filters,
     });
 
     if (result.error) {
@@ -132,6 +139,7 @@ export class Session {
       this.state = "terminated";
     } else {
       this.state = "running";
+      this.startBgEventLoop();
     }
 
     return result;
@@ -201,6 +209,7 @@ export class Session {
       port: port!,
       runtimePath: cmd.runtime,
       breakpoints,
+      exceptionFilters: cmd.exception_filters,
     });
 
     if (result.error) {
@@ -212,6 +221,7 @@ export class Session {
     // After attach, program is running (breakpoints set, waiting for trigger)
     this.state = "running";
     this.attachedMode = true;
+    this.startBgEventLoop();
     return result;
   }
 
@@ -375,6 +385,7 @@ export class Session {
     const command = kind === "into" ? "stepIn" : kind === "out" ? "stepOut" : "next";
     await this.client.request(command, { threadId: this.threadId });
     this.state = "running";
+    this.startBgEventLoop();
     return this.waitForStop();
   }
 
@@ -389,6 +400,7 @@ export class Session {
 
     await this.client.request("continue", { threadId: this.threadId });
     this.state = "running";
+    this.startBgEventLoop();
     return this.waitForStop();
   }
 
@@ -397,15 +409,34 @@ export class Session {
 
     // Poll for stopped/terminated events
     while (true) {
+      // If bg loop already transitioned state, return immediately
+      if (this.state === "paused") {
+        const reason = this.bgStopReason;
+        this.bgStopReason = null;
+        const loc = await this.currentLocation();
+        return {
+          status: "paused",
+          reason: reason || "breakpoint",
+          location: loc,
+        };
+      }
+      if (this.state === "terminated") {
+        return { status: "terminated" };
+      }
+
       const stopped = await this.client.waitForEvent("stopped", 1000);
       if (stopped) {
         this.state = "paused";
-        const body = (stopped.body || {}) as { reason?: string; threadId?: number };
+        this.stopBgEventLoop();
+        const body = (stopped.body || {}) as { reason?: string; threadId?: number; text?: string; description?: string };
         this.threadId = body.threadId ?? this.threadId;
         await this.updateFrame();
+        const detail = body.reason === "exception" && body.text
+          ? `${body.text}: ${body.description || ""}`.trim()
+          : body.reason;
         return {
           status: "paused",
-          reason: body.reason || "unknown",
+          reason: detail || "unknown",
           location: await this.currentLocation(),
         };
       }
@@ -500,6 +531,7 @@ export class Session {
   }
 
   async close(): Promise<CommandResult> {
+    this.stopBgEventLoop();
     await this.cleanup();
     this.state = "idle";
     this.threadId = null;
@@ -507,6 +539,49 @@ export class Session {
     this._scriptPath = null;
     this.attachedMode = false;
     return { status: "closed" };
+  }
+
+  /**
+   * Background event loop: monitors DAP events while the program is running.
+   * Automatically transitions session state when stopped/terminated events arrive,
+   * so `status` and `stack` reflect the real program state without requiring `continue`.
+   */
+  private startBgEventLoop(): void {
+    if (this.bgLoop || !this.client) return;
+    this.bgLoopAbort = false;
+
+    this.bgLoop = (async () => {
+      while (!this.bgLoopAbort && this.client && this.state === "running") {
+        const stopped = await this.client.waitForEvent("stopped", 1000);
+        if (this.bgLoopAbort) break;
+
+        if (stopped) {
+          this.state = "paused";
+          const body = (stopped.body || {}) as { reason?: string; threadId?: number; text?: string; description?: string };
+          this.threadId = body.threadId ?? this.threadId;
+          this.bgStopReason = body.reason === "exception" && body.text
+            ? `${body.text}: ${body.description || ""}`.trim()
+            : (body.reason || "unknown");
+          await this.updateFrame();
+          return; // pause the bg loop — continueExecution will restart it
+        }
+
+        const terminated = this.client.drainEvents("terminated");
+        const exited = this.client.drainEvents("exited");
+        if (terminated.length || exited.length) {
+          this.state = "terminated";
+          return;
+        }
+
+        this.client.drainEvents("output");
+      }
+    })().catch(() => { /* swallow — bg loop errors are not fatal */ });
+  }
+
+  private stopBgEventLoop(): void {
+    this.bgLoopAbort = true;
+    this.bgLoop = null;
+    this.bgStopReason = null;
   }
 
   private async cleanup(): Promise<void> {

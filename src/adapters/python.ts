@@ -168,8 +168,8 @@ export class PythonAdapter implements AdapterConfig {
       }
     }
 
-    // 5. Exception breakpoints (empty = no exception breaking)
-    await client.request("setExceptionBreakpoints", { filters: [] });
+    // 5. Exception breakpoints
+    await client.request("setExceptionBreakpoints", { filters: opts.exceptionFilters || [] });
 
     // 6. configurationDone
     await client.request("configurationDone");
@@ -183,10 +183,13 @@ export class PythonAdapter implements AdapterConfig {
     // 8. Wait for stopped event (breakpoint hit or entry)
     const stopped = await client.waitForEvent("stopped", 15000);
     if (stopped) {
-      const body = (stopped.body || {}) as { reason?: string; threadId?: number };
+      const body = (stopped.body || {}) as { reason?: string; threadId?: number; text?: string; description?: string };
+      const detail = body.reason === "exception" && body.text
+        ? `${body.text}: ${body.description || ""}`.trim()
+        : body.reason;
       return {
         status: "paused",
-        reason: body.reason || "unknown",
+        reason: detail || "unknown",
         breakpoints: bpResults,
       };
     }
@@ -265,7 +268,7 @@ export class PythonAdapter implements AdapterConfig {
     }
 
     // 7. Exception breakpoints
-    await client.request("setExceptionBreakpoints", { filters: [] });
+    await client.request("setExceptionBreakpoints", { filters: opts.exceptionFilters || [] });
 
     // 8. configurationDone
     await client.request("configurationDone");

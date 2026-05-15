@@ -21,6 +21,7 @@ export interface LaunchOpts {
 
 export interface InitFlowOpts extends LaunchOpts {
   breakpoints?: Array<{ file: string; lines: number[]; conditions?: Array<string | null> }>;
+  exceptionFilters?: string[];
 }
 
 export interface AttachFlowOpts {
@@ -29,6 +30,7 @@ export interface AttachFlowOpts {
   /** Path to language runtime (needed to spawn adapter). */
   runtimePath?: string;
   breakpoints?: Array<{ file: string; lines: number[]; conditions?: Array<string | null> }>;
+  exceptionFilters?: string[];
 }
 
 export interface InjectResult {

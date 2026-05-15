@@ -117,8 +117,8 @@ export class RustAdapter implements AdapterConfig {
       }
     }
 
-    // 5. Exception breakpoints (empty = no exception breaking, required by spec)
-    await client.request("setExceptionBreakpoints", { filters: [] });
+    // 5. Exception breakpoints
+    await client.request("setExceptionBreakpoints", { filters: opts.exceptionFilters || [] });
 
     // 6. configurationDone
     await client.request("configurationDone");

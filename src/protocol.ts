@@ -34,6 +34,7 @@ export const AttachCommand = z.object({
   language: z.string().optional(),
   runtime: z.string().optional(),
   breakpoints: z.array(z.string()).optional(),
+  exception_filters: z.array(z.string()).optional(),
 });
 
 export const VarsCommand = z.object({ action: z.literal("vars") });

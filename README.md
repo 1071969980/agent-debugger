@@ -101,6 +101,7 @@ agent-debugger start <script> [options]
 
 Options:
   --break, -b <file:line[:condition]>   Set a breakpoint (repeatable)
+  --catch [filter]                      Pause on exceptions (repeatable, default: uncaught)
   --runtime <path>                      Path to language runtime (e.g. python, node)
   --stop-on-entry                       Pause on the first line
   --args <...>                          Arguments to pass to the script
@@ -115,6 +116,7 @@ agent-debugger attach [host:]port [options]
 Options:
   --pid <PID>                           Attach to a running process by PID
   --break, -b <file:line[:condition]>   Set a breakpoint (repeatable)
+  --catch [filter]                      Pause on exceptions (repeatable, default: uncaught)
   --runtime <path>                      Path to language runtime (optional, auto-detected)
   --language <name>                     Language adapter (default: python)
 ```
@@ -171,6 +173,35 @@ agent-debugger start app.py --break "app.py:30:i == 50"
 # Add a breakpoint to a running session
 agent-debugger break app.py:60
 ```
+
+### Exception Breakpoints
+
+Pause automatically when an exception is thrown:
+
+```bash
+agent-debugger start app.py --catch              # uncaught exceptions (default)
+agent-debugger start app.py --catch raised        # all exceptions, including caught ones
+agent-debugger start app.py --break app.py:25 --catch   # combine with breakpoints
+agent-debugger attach --pid 12345 --catch         # works with attach too
+```
+
+When an exception triggers, the session transitions to `paused` and the output includes the exception type and message:
+
+```
+Status: paused (ZeroDivisionError: division by zero)
+  app.py:42 in process_data
+```
+
+The debugger monitors for exceptions in the background. Use `status` to check the current state at any time — it will show `paused` automatically when an exception hits, even if you haven't called `continue`.
+
+Filter names are language-specific:
+
+| Language | Filters |
+|----------|---------|
+| Python | `raised`, `uncaught`, `userUnhandled` |
+| JavaScript | `all`, `uncaught` |
+| Go | `all`, `uncaught` |
+| Rust | `panic` |
 
 ## Supported Languages
 

@@ -45,12 +45,12 @@ The debugger is a scalpel, not a flashlight. You don't turn it on to look around
 
 ```bash
 # If installed globally:
-agent-debugger start <script> --break file:line[:condition] [--runtime path] [--args ...]
+agent-debugger start <script> --break file:line[:condition] [--catch [filter]] [--runtime path] [--args ...]
 
 # If not installed:
-npx -y agent-debugger start <script> --break file:line[:condition] [--runtime path] [--args ...]
-agent-debugger attach --pid <PID> [--break file:line]    # Attach to running process (no restart needed)
-agent-debugger attach [host:]port [--break file:line]    # Attach to existing debug server
+npx -y agent-debugger start <script> --break file:line[:condition] [--catch [filter]] [--runtime path] [--args ...]
+agent-debugger attach --pid <PID> [--break file:line] [--catch [filter]]    # Attach to running process (no restart needed)
+agent-debugger attach [host:]port [--break file:line] [--catch [filter]]    # Attach to existing debug server
 agent-debugger eval <expression>        # Run any expression in the current frame
 agent-debugger vars                     # List local variables (prefer eval)
 agent-debugger step [into|out]          # Step over / into function / out of function
@@ -184,6 +184,39 @@ agent-debugger start app.py --break "app.py:55:len(results) > 100"
 
 If it hits, you've caught the crime in progress. If it doesn't hit, your theory was wrong — move on.
 
+### Exception Debugging
+
+A program crashes or throws an error you didn't expect. Don't guess — catch the exception in the act.
+
+```bash
+# Program crashes? Catch the unhandled exception at the crash point.
+agent-debugger start app.py --catch
+# → Status: paused (ValueError: invalid literal for int() with base 10: 'abc')
+#   app.py:42 in process_data
+
+agent-debugger eval "data"              # see what caused it
+agent-debugger stack                    # see how you got here
+agent-debugger close
+```
+
+For exceptions caught by try/except (silent failures, swallowed errors):
+
+```bash
+# --catch raised catches ALL exceptions, even caught ones
+agent-debugger start app.py --catch raised
+agent-debugger eval "val"               # the value that triggered the exception
+agent-debugger eval "i"                 # which iteration
+agent-debugger close
+```
+
+The debugger monitors for exceptions in the background — `status` reflects the real program state without needing to call `continue` first. This applies to long-running processes too: start the server with `--catch`, trigger the code path, then check `status`.
+
+Exception filters are language-specific:
+- Python: `uncaught` (default), `raised`, `userUnhandled`
+- JavaScript: `uncaught` (default), `all`
+- Go: `uncaught` (default), `all`
+- Rust: `panic`
+
 ### Recursion / Deep Call Chains
 
 The stack tells you how you arrived. The eval tells you why you're wrong.
@@ -292,6 +325,8 @@ agent-debugger eval "users[2]"                           # {'name': 'Charlie', '
 ## Notes
 
 - Use **absolute paths** for breakpoints
+- `--catch` (no argument) defaults to catching uncaught exceptions — works for all languages
+- `--catch raised` (Python) catches all exceptions including those caught by try/except
 - Multiple sessions supported — use `--session <id>` to target a specific one, or omit it when only one exists
 - `attach --pid` auto-installs debugpy — no manual setup needed
 - `attach --pid` requires lldb (macOS, included with Xcode CLI tools) or gdb (Linux)
