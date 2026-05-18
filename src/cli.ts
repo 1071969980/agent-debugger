@@ -200,10 +200,33 @@ function formatResult(result: CommandResult): string {
     return result.source;
   }
 
-  // Breakpoint set
+  // Breakpoint set (break add)
   if (result.verified !== undefined) {
     const v = result.verified ? "verified" : "pending";
-    return `  Breakpoint: ${result.file}:${result.line} (${v})`;
+    const cond = result.condition ? `  condition: ${result.condition}` : "";
+    return `  Breakpoint: ${result.file}:${result.line} (${v})${cond}`;
+  }
+
+  // Breakpoint removed
+  if (result.status === "removed") {
+    return `  Removed breakpoint: ${result.file}:${result.line}`;
+  }
+
+  // Breakpoints cleared
+  if (result.status === "cleared") {
+    return `  Cleared ${result.count} breakpoint(s).`;
+  }
+
+  // Breakpoint list (when returned as standalone, not part of start/attach)
+  if (result.breakpoints && result.count !== undefined && !result.status) {
+    if (result.count === 0) return "  No breakpoints.";
+    const out: string[] = [`  Breakpoints (${result.count}):`];
+    for (const bp of result.breakpoints) {
+      const v = bp.verified ? "verified" : "pending";
+      const cond = bp.condition ? `  condition: ${bp.condition}` : "";
+      out.push(`  ${bp.file}:${bp.line} (${v})${cond}`);
+    }
+    return out.join("\n");
   }
 
   // Running (e.g. after attach — breakpoints set, waiting for trigger)
@@ -242,15 +265,18 @@ function formatResult(result: CommandResult): string {
 const HELP = `agent-debugger \u2014 CLI debugger for AI agents
 
 Usage:
-  agent-debugger start <script> [--break file:line] [--catch [filter]] [--runtime path] [--args ...]
-  agent-debugger attach --pid <PID> [--break file:line] [--catch [filter]]
-  agent-debugger attach [host:]port [--break file:line] [--catch [filter]]
+  agent-debugger start <script> [--break file:line]... [--catch [filter]] [--runtime path] [--args ...]
+  agent-debugger attach --pid <PID> [--break file:line]... [--catch [filter]]
+  agent-debugger attach [host:]port [--break file:line]... [--catch [filter]]
   agent-debugger vars                        Get local variables
   agent-debugger eval <expression>           Evaluate expression
   agent-debugger step [into|out]             Step over/into/out
   agent-debugger continue                    Continue / wait for next breakpoint
   agent-debugger stack                       Show call stack
-  agent-debugger break <file:line[:cond]>    Add breakpoint
+  agent-debugger break add <file:line[:cond]>  Add breakpoint
+  agent-debugger break list                     List breakpoints
+  agent-debugger break rm <file:line>           Remove breakpoint
+  agent-debugger break clear                    Clear all breakpoints
   agent-debugger source [file] [line]        Show source code
   agent-debugger status                      Show session state
   agent-debugger close                       Close a debug session
@@ -468,22 +494,43 @@ async function main(): Promise<void> {
       } else if (command === "continue" || command === "cont" || command === "c") {
         result = await sendCommand({ action: "continue" }, sid);
       } else if (command === "break" || command === "bp") {
-        if (args.length < 2) {
-          process.stderr.write("Error: missing location. Usage: agent-debugger break <file:line[:condition]>\n");
+        const sub = args[1];
+        if (!sub || sub.startsWith("-")) {
+          process.stderr.write("Error: missing subcommand. Usage: agent-debugger break <add|list|rm|clear> ...\n");
           process.exit(1);
         }
-        const parts = args[1]!.split(":");
-        if (parts.length < 2) {
-          process.stderr.write("Error: invalid breakpoint format. Use file:line or file:line:condition\n");
+        if (sub === "list") {
+          result = await sendCommand({ action: "break", sub: "list" }, sid);
+        } else if (sub === "clear") {
+          result = await sendCommand({ action: "break", sub: "clear" }, sid);
+        } else if (sub === "rm") {
+          if (!args[2]) {
+            process.stderr.write("Error: missing location. Usage: agent-debugger break rm <file:line>\n");
+            process.exit(1);
+          }
+          const parts = args[2]!.split(":");
+          if (parts.length < 2) {
+            process.stderr.write("Error: invalid format. Use file:line\n");
+            process.exit(1);
+          }
+          result = await sendCommand({ action: "break", sub: "rm", file: parts[0]!, line: parseInt(parts[1]!, 10) }, sid);
+        } else if (sub === "add") {
+          if (!args[2]) {
+            process.stderr.write("Error: missing location. Usage: agent-debugger break add <file:line[:condition]>\n");
+            process.exit(1);
+          }
+          const parts = args[2]!.split(":");
+          if (parts.length < 2) {
+            process.stderr.write("Error: invalid format. Use file:line or file:line:condition\n");
+            process.exit(1);
+          }
+          const bpCmd: Record<string, unknown> = { action: "break", sub: "add", file: parts[0]!, line: parseInt(parts[1]!, 10) };
+          if (parts.length > 2) bpCmd.condition = parts.slice(2).join(":");
+          result = await sendCommand(bpCmd, sid);
+        } else {
+          process.stderr.write(`Error: unknown subcommand '${sub}'. Use: add, list, rm, clear\n`);
           process.exit(1);
         }
-        const bpCmd: Record<string, unknown> = {
-          action: "break",
-          file: parts[0]!,
-          line: parseInt(parts[1]!, 10),
-        };
-        if (parts.length > 2) bpCmd.condition = parts.slice(2).join(":");
-        result = await sendCommand(bpCmd, sid);
       } else if (command === "source") {
         const srcCmd: Record<string, unknown> = { action: "source" };
         if (args.length > 1) srcCmd.file = args[1]!;

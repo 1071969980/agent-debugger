@@ -6,7 +6,7 @@ import type { ChildProcess } from "node:child_process";
 import { DAPClient } from "./dap-client.js";
 import type { AdapterConfig } from "./adapters/base.js";
 import { getAdapterForFile, getAdapter } from "./adapters/registry.js";
-import type { Command, CommandResult, LocationInfo, VariableInfo, ExceptionDetail } from "./protocol.js";
+import type { Command, CommandResult, LocationInfo, VariableInfo, ExceptionDetail, BreakpointInfo } from "./protocol.js";
 
 export type SessionState = "idle" | "starting" | "running" | "paused" | "terminated";
 
@@ -28,6 +28,8 @@ export class Session {
   private bgLoopAbort = false;
   /** Stop reason captured by the background event loop, consumed by waitForStop. */
   private bgStopReason: string | null = null;
+  /** Tracked breakpoints: file path → [{ line, condition }]. */
+  private breakpoints = new Map<string, Array<{ line: number; condition: string | null }>>();
 
   async handleCommand(cmd: Command): Promise<CommandResult> {
     switch (cmd.action) {
@@ -45,8 +47,15 @@ export class Session {
         return this.step(cmd.kind || "over");
       case "continue":
         return this.continueExecution();
-      case "break":
-        return this.setBreakpoint(cmd.file, cmd.line, cmd.condition);
+      case "break": {
+        const breakCmd = cmd as Extract<Command, { action: "break" }>;
+        switch (breakCmd.sub) {
+          case "add": return this.addBreakpoint(breakCmd.file!, breakCmd.line!, breakCmd.condition);
+          case "list": return this.listBreakpoints();
+          case "rm": return this.removeBreakpoint(breakCmd.file!, breakCmd.line!);
+          case "clear": return this.clearBreakpoints();
+        }
+      }
       case "source":
         return this.getSourceAsync(cmd.file, cmd.line);
       case "status":
@@ -145,6 +154,11 @@ export class Session {
       this.startBgEventLoop();
     }
 
+    // Load initial breakpoints into tracker
+    if (result.breakpoints) {
+      this.loadTrackedBreakpoints(result.breakpoints);
+    }
+
     return result;
   }
 
@@ -225,6 +239,12 @@ export class Session {
     this.state = "running";
     this.attachedMode = true;
     this.startBgEventLoop();
+
+    // Load initial breakpoints into tracker
+    if (result.breakpoints) {
+      this.loadTrackedBreakpoints(result.breakpoints);
+    }
+
     return result;
   }
 
@@ -253,6 +273,18 @@ export class Session {
       lines: data.lines,
       conditions: data.conditions,
     }));
+  }
+
+  /** Load adapter-reported breakpoints into the session tracker. */
+  private loadTrackedBreakpoints(bps: Array<{ file: string; line: number; verified?: boolean; condition?: string | null }>): void {
+    for (const bp of bps) {
+      let list = this.breakpoints.get(bp.file);
+      if (!list) {
+        list = [];
+        this.breakpoints.set(bp.file, list);
+      }
+      list.push({ line: bp.line, condition: bp.condition ?? null });
+    }
   }
 
   private async updateFrame(): Promise<void> {
@@ -415,6 +447,10 @@ export class Session {
     if (this.state !== "paused") return { error: "Program is not paused" };
     if (!this.client || this.threadId === null) return { error: "No active session" };
 
+    if (this.bgStopReason) {
+      return { error: "Program was paused by a background event. Run 'agent-debugger status' to inspect before stepping." };
+    }
+
     const command = kind === "into" ? "stepIn" : kind === "out" ? "stepOut" : "next";
     await this.client.request(command, { threadId: this.threadId });
     this.state = "running";
@@ -430,6 +466,10 @@ export class Session {
     }
     if (this.state !== "paused") return { error: "Program is not paused" };
     if (!this.client || this.threadId === null) return { error: "No active session" };
+
+    if (this.bgStopReason) {
+      return { error: "Program was paused by a background event. Run 'agent-debugger status' to inspect before continuing." };
+    }
 
     await this.client.request("continue", { threadId: this.threadId });
     this.state = "running";
@@ -494,24 +534,87 @@ export class Session {
     }
   }
 
-  private async setBreakpoint(filePath: string, line: number, condition?: string): Promise<CommandResult> {
+  private async syncBreakpointsToFile(absPath: string): Promise<{ success: boolean; verified: boolean[] }> {
+    if (!this.client) return { success: false, verified: [] };
+    const list = this.breakpoints.get(absPath) || [];
+    const bpArgs: Record<string, unknown> = {
+      source: { path: absPath },
+      breakpoints: list.map(bp => {
+        const entry: Record<string, unknown> = { line: bp.line };
+        if (bp.condition) entry.condition = bp.condition;
+        return entry;
+      }),
+    };
+    const resp = await this.client.request("setBreakpoints", bpArgs);
+    if (!resp.success || !resp.body) return { success: false, verified: [] };
+    const bps = (resp.body as { breakpoints?: Array<{ line?: number; verified?: boolean }> }).breakpoints || [];
+    return { success: true, verified: bps.map(b => b.verified ?? false) };
+  }
+
+  private async addBreakpoint(filePath: string, line: number, condition?: string): Promise<CommandResult> {
     if (!this.client) return { error: "No active session" };
 
     const absPath = pathResolve(filePath);
-    const bpArgs: Record<string, unknown> = {
-      source: { path: absPath },
-      breakpoints: [condition ? { line, condition } : { line }],
-    };
+    let list = this.breakpoints.get(absPath);
+    if (list?.some(bp => bp.line === line)) {
+      return { error: `Breakpoint already exists at ${absPath}:${line}` };
+    }
+    if (!list) {
+      list = [];
+      this.breakpoints.set(absPath, list);
+    }
+    list.push({ line, condition: condition ?? null });
 
-    const resp = await this.client.request("setBreakpoints", bpArgs);
-    if (resp.success && resp.body) {
-      const bps = (resp.body as { breakpoints?: Array<{ line?: number; verified?: boolean }> }).breakpoints;
-      if (bps?.length) {
-        const bp = bps[0]!;
-        return { file: absPath, line: bp.line ?? line, verified: bp.verified ?? false };
+    const sync = await this.syncBreakpointsToFile(absPath);
+    if (!sync.success) {
+      // rollback
+      list.pop();
+      if (list.length === 0) this.breakpoints.delete(absPath);
+      return { error: "Failed to set breakpoint" };
+    }
+
+    const idx = list.length - 1;
+    return { file: absPath, line, verified: sync.verified[idx] ?? false, condition: condition ?? null };
+  }
+
+  private listBreakpoints(): CommandResult {
+    const result: BreakpointInfo[] = [];
+    for (const [file, list] of this.breakpoints) {
+      for (const bp of list) {
+        result.push({ file, line: bp.line, verified: true, condition: bp.condition });
       }
     }
-    return { error: "Failed to set breakpoint" };
+    return { breakpoints: result, count: result.length };
+  }
+
+  private async removeBreakpoint(filePath: string, line: number): Promise<CommandResult> {
+    if (!this.client) return { error: "No active session" };
+
+    const absPath = pathResolve(filePath);
+    const list = this.breakpoints.get(absPath);
+    if (!list) return { error: `No breakpoints in ${absPath}` };
+
+    const idx = list.findIndex(bp => bp.line === line);
+    if (idx === -1) return { error: `No breakpoint at ${absPath}:${line}` };
+
+    list.splice(idx, 1);
+    if (list.length === 0) this.breakpoints.delete(absPath);
+
+    await this.syncBreakpointsToFile(absPath);
+    return { status: "removed", file: absPath, line };
+  }
+
+  private async clearBreakpoints(): Promise<CommandResult> {
+    if (!this.client) return { error: "No active session" };
+
+    let count = 0;
+    for (const file of this.breakpoints.keys()) {
+      count += this.breakpoints.get(file)!.length;
+      this.breakpoints.set(file, []);
+      await this.syncBreakpointsToFile(file);
+    }
+    this.breakpoints.clear();
+    return { status: "cleared", count };
   }
 
   private async getSourceAsync(filePath?: string, line?: number): Promise<CommandResult> {
@@ -560,11 +663,20 @@ export class Session {
   }
 
   async getStatusAsync(): Promise<CommandResult> {
-    const result: CommandResult = { state: this.state };
     if (this.state === "paused") {
-      result.location = await this.currentLocation();
+      const reason = this.bgStopReason;
+      if (reason) {
+        this.bgStopReason = null;
+        return {
+          status: "paused",
+          reason,
+          exception: await this.fetchExceptionInfo(),
+          location: await this.currentLocation(),
+        };
+      }
+      return { state: this.state, location: await this.currentLocation() };
     }
-    return result;
+    return { state: this.state };
   }
 
   async close(): Promise<CommandResult> {
@@ -575,6 +687,7 @@ export class Session {
     this.frameId = null;
     this._scriptPath = null;
     this.attachedMode = false;
+    this.breakpoints.clear();
     return { status: "closed" };
   }
 

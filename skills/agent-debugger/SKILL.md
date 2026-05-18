@@ -26,7 +26,7 @@ The debugger is a scalpel, not a flashlight. You don't turn it on to look around
 
 3. **Eval, don't dump.** `vars` dumps everything and answers nothing. `eval "type(data['age'])"` answers exactly one question. Prefer eval. Always.
 
-4. **Never step through loops.** A loop with 100 iterations is 100 step commands. A conditional breakpoint is 1 command. Use `--break "file:line:i == 50"` to jump straight to the iteration that matters.
+4. **Never step through loops.** A loop with 100 iterations is 100 step commands. A conditional breakpoint is 1 command. Use `--break "file:line:i == 50"` to set one at startup, or `break add "file:line:i == 50"` mid-session to jump straight to the iteration that matters.
 
 5. **Two strikes, new theory.** If your hypothesis was wrong twice, stop. Your mental model of the code is broken, not the debugger session. Close, re-read the code, form a completely different theory, then start a new session with different breakpoints. Continuing to probe the same area has exponentially diminishing returns.
 
@@ -56,7 +56,10 @@ agent-debugger vars                     # List local variables (prefer eval)
 agent-debugger step [into|out]          # Step over / into function / out of function
 agent-debugger continue                 # Run to next breakpoint / wait for hit after attach
 agent-debugger stack                    # Show call stack
-agent-debugger break file:line[:cond]   # Add breakpoint mid-session
+agent-debugger break add <file:line[:cond]>  # Add breakpoint mid-session
+agent-debugger break list                     # List all breakpoints
+agent-debugger break rm <file:line>           # Remove breakpoint
+agent-debugger break clear                    # Clear all breakpoints
 agent-debugger source                   # Show source around current line
 agent-debugger status                   # Show session state and location
 agent-debugger close                    # Close a debug session

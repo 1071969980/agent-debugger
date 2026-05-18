@@ -54,8 +54,9 @@ export const ContinueCommand = z.object({ action: z.literal("continue") });
 
 export const BreakCommand = z.object({
   action: z.literal("break"),
-  file: z.string(),
-  line: z.number(),
+  sub: z.enum(["add", "list", "rm", "clear"]),
+  file: z.string().optional(),
+  line: z.number().optional(),
   condition: z.string().optional(),
 });
 
@@ -100,6 +101,7 @@ export interface BreakpointInfo {
   file: string;
   line: number;
   verified: boolean;
+  condition?: string | null;
 }
 
 export interface VariableInfo {
@@ -138,6 +140,7 @@ export interface CommandResult {
   file?: string;
   line?: number;
   verified?: boolean;
+  condition?: string | null;
   state?: string;
   message?: string;
   sessions?: SessionInfo[];

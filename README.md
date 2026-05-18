@@ -65,7 +65,10 @@ agent-debugger close          # detaches without killing the server
 | `step [into\|out]` | Step over, into a function, or out of a function |
 | `continue` | Resume execution / wait for next breakpoint |
 | `stack` | Show the call stack |
-| `break <file:line[:condition]>` | Add a breakpoint mid-session |
+| `break add <file:line[:cond]>` | Add a breakpoint mid-session |
+| `break list` | List all breakpoints |
+| `break rm <file:line>` | Remove a breakpoint |
+| `break clear` | Clear all breakpoints |
 | `source [file] [line]` | Show source code around the current line |
 | `status` | Show session state and current location |
 | `close` | Close the current debug session |
@@ -164,14 +167,18 @@ debugpy.listen(5678)
 Multiple breakpoints and conditional breakpoints are supported:
 
 ```bash
-# Multiple breakpoints
+# Multiple breakpoints at startup
 agent-debugger start app.py --break app.py:25 --break app.py:40
 
 # Conditional breakpoint — only pause when the condition is true
 agent-debugger start app.py --break "app.py:30:i == 50"
 
-# Add a breakpoint to a running session
-agent-debugger break app.py:60
+# Manage breakpoints mid-session
+agent-debugger break add app.py:60                 # add
+agent-debugger break add "app.py:42:len(items) > 10"  # conditional
+agent-debugger break list                           # list all
+agent-debugger break rm app.py:60                   # remove one
+agent-debugger break clear                          # remove all
 ```
 
 ### Exception Breakpoints
