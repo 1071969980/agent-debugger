@@ -1,10 +1,11 @@
 /** Python debug adapter — debugpy. */
 
 import { spawn as cpSpawn, type ChildProcess } from "node:child_process";
-import type { DAPClient } from "../dap-client.js";
+import { DAPClient } from "../dap-client.js";
 import type { StackFrame, Variable } from "../dap-types.js";
 import type { CommandResult } from "../protocol.js";
-import type { AdapterConfig, SpawnResult, InjectResult, LaunchOpts, InitFlowOpts, AttachFlowOpts } from "./base.js";
+import type { AdapterConfig, SpawnResult, InjectResult, LaunchOpts, InitFlowOpts, AttachFlowOpts, SubprocessInfo } from "./base.js";
+import type { DAPRequest } from "../dap-types.js";
 import { getFreePort } from "../util/ports.js";
 
 export class PythonAdapter implements AdapterConfig {
@@ -89,6 +90,7 @@ export class PythonAdapter implements AdapterConfig {
       columnsStartAt1: true,
       supportsVariableType: true,
       supportsRunInTerminalRequest: false,
+      supportsStartDebuggingRequest: true,
     };
   }
 
@@ -100,6 +102,7 @@ export class PythonAdapter implements AdapterConfig {
       console: "internalConsole",
       stopOnEntry: opts.stopOnEntry ?? false,
       justMyCode: true,
+      subProcess: true,
     };
     if (opts.runtimePath) {
       args.python = [opts.runtimePath, "-Xfrozen_modules=off"];
@@ -139,6 +142,9 @@ export class PythonAdapter implements AdapterConfig {
     if (!initialized) {
       return { error: "Timeout waiting for initialized event" };
     }
+
+    // 3b. Handle subprocess events that arrived during init
+    await this.drainSubprocessEvents(client, opts);
 
     // 4. Set breakpoints
     const bpResults: Array<{ file: string; line: number; verified: boolean }> = [];
@@ -239,6 +245,9 @@ export class PythonAdapter implements AdapterConfig {
       return { error: "Timeout waiting for initialized event from debugpy" };
     }
 
+    // 5b. Handle subprocess events that arrived during attach
+    await this.drainSubprocessEvents(client, opts);
+
     // 6. Set breakpoints
     const bpResults: Array<{ file: string; line: number; verified: boolean }> = [];
     if (opts.breakpoints?.length) {
@@ -281,6 +290,245 @@ export class PythonAdapter implements AdapterConfig {
 
     // Program is already running — don't wait for stopped event.
     return { status: "running", breakpoints: bpResults };
+  }
+
+  /**
+   * Spawn a debugpy adapter for a subprocess.
+   * Uses --for-server-port to connect to the child's internal debugpy server.
+   */
+  private async spawnSubprocessAdapter(
+    internalPort: number,
+    runtimePath?: string,
+  ): Promise<{ process: ChildProcess; port: number }> {
+    const python = runtimePath || "python3";
+    const externalPort = await getFreePort();
+    const proc = cpSpawn(
+      python,
+      [
+        "-Xfrozen_modules=off",
+        "-m", "debugpy.adapter",
+        "--host", "127.0.0.1",
+        "--port", String(externalPort),
+        "--for-server-port", String(internalPort),
+      ],
+      { stdio: ["pipe", "pipe", "pipe"] },
+    );
+    return { process: proc, port: externalPort };
+  }
+
+  /**
+   * Handle a debugpyWaitingForServer event by spawning a relay adapter
+   * for the subprocess and completing the DAP handshake.
+   */
+  async handleSubprocessEvent(
+    event: { body?: Record<string, unknown> },
+    opts: {
+      runtimePath?: string;
+      breakpoints?: Array<{ file: string; lines: number[]; conditions?: Array<string | null> }>;
+      exceptionFilters?: string[];
+    },
+  ): Promise<SubprocessInfo | null> {
+    const body = event.body || {};
+    const internalPort = body.port as number | undefined;
+    const pid = body.processId as number | undefined;
+    if (!internalPort) {
+      process.stderr.write("agent-debugger: debugpyWaitingForServer event missing port\n");
+      return null;
+    }
+
+    let adapterProc: ChildProcess | undefined;
+    let client: DAPClient | null = null;
+    let handedOff = false;
+
+    try {
+      const spawnResult = await this.spawnSubprocessAdapter(internalPort, opts.runtimePath);
+      adapterProc = spawnResult.process;
+
+      const sc = new DAPClient();
+      client = sc;
+      await sc.connect("127.0.0.1", spawnResult.port);
+
+      const initResp = await sc.request("initialize", this.initializeArgs());
+      if (!initResp.success) {
+        process.stderr.write(`agent-debugger: subprocess init failed: ${initResp.message}\n`);
+        return null;
+      }
+
+      const attachSeq = sc.requestAsync("attach", {
+        type: "debugpy",
+        request: "attach",
+        justMyCode: true,
+        subProcess: true,
+      });
+
+      const initialized = await sc.waitForEvent("initialized", 10000);
+      if (!initialized) {
+        process.stderr.write("agent-debugger: subprocess initialized timeout\n");
+        return null;
+      }
+
+      if (opts.breakpoints?.length) {
+        for (const bp of opts.breakpoints) {
+          const bpArgs: Record<string, unknown> = {
+            source: { path: bp.file },
+            breakpoints: bp.lines.map((line, i) => {
+              const entry: Record<string, unknown> = { line };
+              if (bp.conditions?.[i]) entry.condition = bp.conditions[i];
+              return entry;
+            }),
+          };
+          await sc.request("setBreakpoints", bpArgs);
+        }
+      }
+
+      await sc.request("setExceptionBreakpoints", { filters: opts.exceptionFilters || [] });
+      await sc.request("configurationDone");
+      await sc.waitForResponse(attachSeq, 10000);
+
+      handedOff = true;
+      return { process: adapterProc, client: sc, pid };
+    } catch (err) {
+      process.stderr.write(`agent-debugger: subprocess handler error: ${(err as Error).message}\n`);
+      return null;
+    } finally {
+      if (!handedOff) {
+        if (client) {
+          try { await client.disconnect(false); } catch { /* best effort */ }
+        }
+        adapterProc?.kill();
+      }
+    }
+  }
+
+  /**
+   * Drain and handle any debugpyWaitingForServer events from the client.
+   */
+  async drainSubprocessEvents(
+    client: DAPClient,
+    opts: {
+      host?: string;
+      port?: number;
+      runtimePath?: string;
+      breakpoints?: Array<{ file: string; lines: number[]; conditions?: Array<string | null> }>;
+      exceptionFilters?: string[];
+      onSubprocess?: (info: SubprocessInfo) => void;
+    },
+  ): Promise<void> {
+    // Prefer startDebugging reverse requests (works across port-forward)
+    if (opts.host && opts.port) {
+      const startDebugReqs = client.drainReverseRequests("startDebugging");
+      for (const req of startDebugReqs) {
+        try {
+          const result = await this.handleStartDebugging(req, {
+            host: opts.host,
+            port: opts.port,
+            breakpoints: opts.breakpoints,
+            exceptionFilters: opts.exceptionFilters,
+          }, client);
+          if (result && opts.onSubprocess) opts.onSubprocess(result);
+        } catch (err) {
+          process.stderr.write(`agent-debugger: startDebugging error: ${(err as Error).message}\n`);
+        }
+      }
+    }
+    // Fallback: debugpyWaitingForServer (local debugging, older debugpy)
+    const waitingEvents = client.drainEvents("debugpyWaitingForServer");
+    for (const evt of waitingEvents) {
+      try {
+        const result = await this.handleSubprocessEvent(evt, opts);
+        if (result && opts.onSubprocess) opts.onSubprocess(result);
+      } catch (err) {
+        process.stderr.write(`agent-debugger: subprocess handler error: ${(err as Error).message}\n`);
+      }
+    }
+  }
+
+  /**
+   * Handle a startDebugging reverse request from debugpy.
+   * Creates a new DAP connection to the same host:port and sends attach with subProcessId.
+   * This works across port-forwarded connections (e.g. kubectl port-forward).
+   */
+  async handleStartDebugging(
+    req: DAPRequest,
+    opts: {
+      host: string;
+      port: number;
+      breakpoints?: Array<{ file: string; lines: number[]; conditions?: Array<string | null> }>;
+      exceptionFilters?: string[];
+    },
+    parentClient: DAPClient,
+  ): Promise<SubprocessInfo | null> {
+    const config = (req.arguments?.configuration ?? {}) as Record<string, unknown>;
+    const subProcessId = config.subProcessId as number | undefined;
+    let subClient: DAPClient | null = null;
+    let handedOff = false;
+
+    try {
+      // 1. New DAP connection to the same host:port (already forwarded)
+      const sc = new DAPClient();
+      subClient = sc;
+      await sc.connect(opts.host, opts.port);
+
+      // 2. initialize → attach(subProcessId) → initialized → breakpoints → configurationDone
+      const initResp = await sc.request("initialize", this.initializeArgs());
+      if (!initResp.success) {
+        process.stderr.write(`agent-debugger: startDebugging init failed: ${initResp.message}\n`);
+        parentClient.sendResponse(req.seq, req.command, false);
+        return null;
+      }
+
+      const attachArgs: Record<string, unknown> = {
+        type: "debugpy",
+        request: "attach",
+        justMyCode: true,
+        subProcess: true,
+      };
+      if (subProcessId != null) {
+        attachArgs.subProcessId = subProcessId;
+      }
+      const attachSeq = sc.requestAsync("attach", attachArgs);
+
+      const initialized = await sc.waitForEvent("initialized", 10000);
+      if (!initialized) {
+        process.stderr.write("agent-debugger: startDebugging initialized timeout\n");
+        parentClient.sendResponse(req.seq, req.command, false);
+        return null;
+      }
+
+      // Set breakpoints
+      if (opts.breakpoints?.length) {
+        for (const bp of opts.breakpoints) {
+          const bpArgs: Record<string, unknown> = {
+            source: { path: bp.file },
+            breakpoints: bp.lines.map((line, i) => {
+              const entry: Record<string, unknown> = { line };
+              if (bp.conditions?.[i]) entry.condition = bp.conditions[i];
+              return entry;
+            }),
+          };
+          await sc.request("setBreakpoints", bpArgs);
+        }
+      }
+
+      await sc.request("setExceptionBreakpoints", { filters: opts.exceptionFilters || [] });
+      await sc.request("configurationDone");
+      await sc.waitForResponse(attachSeq, 10000);
+
+      // 3. Send success response to the adapter
+      parentClient.sendResponse(req.seq, req.command, true);
+
+      // 4. Return SubprocessInfo (no adapter process — connection reuses existing adapter)
+      handedOff = true;
+      return { client: sc, pid: subProcessId };
+    } catch (err) {
+      process.stderr.write(`agent-debugger: startDebugging error: ${(err as Error).message}\n`);
+      try { parentClient.sendResponse(req.seq, req.command, false); } catch { /* best effort */ }
+      return null;
+    } finally {
+      if (!handedOff && subClient) {
+        try { await subClient.disconnect(false); } catch { /* best effort */ }
+      }
+    }
   }
 
   isInternalFrame(frame: StackFrame): boolean {

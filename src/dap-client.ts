@@ -2,7 +2,7 @@
 
 import { Socket } from "node:net";
 import { EventEmitter } from "node:events";
-import type { DAPResponse, DAPEvent } from "./dap-types.js";
+import type { DAPResponse, DAPEvent, DAPRequest } from "./dap-types.js";
 
 interface PendingRequest {
   resolve: (resp: DAPResponse) => void;
@@ -17,6 +17,7 @@ export class DAPClient extends EventEmitter {
   /** Deferred promises for requestAsync — survives dispatch resolution. */
   private asyncResponses = new Map<number, Deferred<DAPResponse>>();
   private eventQueue: DAPEvent[] = [];
+  private reverseRequestQueue: DAPRequest[] = [];
   private buffer = Buffer.alloc(0);
   private capabilities: Record<string, unknown> = {};
 
@@ -140,6 +141,11 @@ export class DAPClient extends EventEmitter {
       this.eventQueue.push(evt);
       this.emit("event", evt);
       this.emit(`event:${evt.event}`, evt);
+    } else if (msg.type === "request") {
+      const req = msg as unknown as DAPRequest;
+      this.reverseRequestQueue.push(req);
+      this.emit("reverseRequest", req);
+      this.emit(`reverseRequest:${req.command}`, req);
     }
   }
 
@@ -243,6 +249,31 @@ export class DAPClient extends EventEmitter {
     return all;
   }
 
+  /** Send a response to a reverse request from the debug adapter. */
+  sendResponse(requestSeq: number, command: string, success: boolean, body?: Record<string, unknown>): void {
+    this.seq++;
+    this.send({
+      seq: this.seq,
+      type: "response",
+      request_seq: requestSeq,
+      command,
+      success,
+      ...(body !== undefined ? { body } : {}),
+    });
+  }
+
+  /** Drain all reverse requests, optionally filtered by command. */
+  drainReverseRequests(command?: string): DAPRequest[] {
+    if (command) {
+      const matched = this.reverseRequestQueue.filter((r) => r.command === command);
+      this.reverseRequestQueue = this.reverseRequestQueue.filter((r) => r.command !== command);
+      return matched;
+    }
+    const all = [...this.reverseRequestQueue];
+    this.reverseRequestQueue = [];
+    return all;
+  }
+
   getCapabilities(): Record<string, unknown> {
     return this.capabilities;
   }
@@ -263,6 +294,8 @@ export class DAPClient extends EventEmitter {
       }
       this.pending.clear();
       this.asyncResponses.clear();
+      this.eventQueue = [];
+      this.reverseRequestQueue = [];
     }
   }
 

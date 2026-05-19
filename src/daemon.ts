@@ -15,6 +15,16 @@ class Daemon {
   /** Per-session command serialization queue. */
   private sessionQueues = new Map<string, Promise<CommandResult>>();
 
+  /** Parse a path-based session_id like "abc/p12345" into parent + subprocess parts. */
+  private parseSessionPath(sessionId: string): { parentId: string; subprocessId?: string } {
+    const idx = sessionId.indexOf("/");
+    if (idx === -1) return { parentId: sessionId };
+    return {
+      parentId: sessionId.substring(0, idx),
+      subprocessId: sessionId.substring(idx + 1) || undefined,
+    };
+  }
+
   start(): void {
     mkdirSync(SESSION_DIR, { recursive: true });
 
@@ -142,9 +152,34 @@ class Daemon {
           if (!targetId) {
             result = { error: "No active session" };
           } else {
-            result = await this.enqueueCommand(targetId, cmd);
-            if (!result.error) {
-              this.removeSession(targetId);
+            const { parentId, subprocessId } = this.parseSessionPath(targetId);
+            if (subprocessId) {
+              // Close subprocess only
+              const session = this.sessions.get(parentId);
+              if (!session) {
+                result = { error: `Session not found: ${parentId}` };
+              } else {
+                result = await session.handleSubprocessCommand(subprocessId, cmd);
+              }
+            } else {
+              result = await this.enqueueCommand(targetId, cmd);
+              if (!result.error) {
+                this.removeSession(targetId);
+              }
+            }
+          }
+          break;
+        }
+        case "subprocess": {
+          const subTargetId = sessionId ?? this.resolveSingleSession();
+          if (!subTargetId) {
+            result = { error: "No active session. Start or attach first." };
+          } else {
+            const session = this.sessions.get(subTargetId);
+            if (!session) {
+              result = { error: `Session not found: ${subTargetId}` };
+            } else {
+              result = session.listSubprocesses();
             }
           }
           break;
@@ -154,11 +189,19 @@ class Daemon {
           if (!id) {
             result = { error: "No active session. Start or attach first." };
           } else {
-            result = await this.enqueueCommand(id, cmd);
-            // Auto-cleanup terminated sessions
-            const session = this.sessions.get(id);
-            if (session && session.state === "terminated") {
-              this.removeSession(id);
+            const { parentId, subprocessId } = this.parseSessionPath(id);
+            if (subprocessId) {
+              result = await this.enqueueSubprocessCommand(parentId, subprocessId, cmd);
+              const parent = this.sessions.get(parentId);
+              if (parent && parent.state === "terminated") {
+                this.removeSession(parentId);
+              }
+            } else {
+              result = await this.enqueueCommand(id, cmd);
+              const session = this.sessions.get(id);
+              if (session && session.state === "terminated") {
+                this.removeSession(id);
+              }
             }
           }
         }
@@ -229,17 +272,36 @@ class Daemon {
 
     const prev = this.sessionQueues.get(sessionId) ?? Promise.resolve({} as CommandResult);
     const next = prev.then(async () => {
-      if (cmd.action === "start" || cmd.action === "attach") {
-        return s.handleCommand(cmd);
-      }
-      if (cmd.action === "status") {
-        return s.getStatusAsync();
-      }
       return s.handleCommand(cmd);
     });
 
     this.sessionQueues.set(sessionId, next.catch((err) => ({
       error: `Session ${sessionId} error: ${(err as Error).message}`,
+    })));
+
+    return next;
+  }
+
+  /**
+   * Serialize subprocess commands on the parent session's queue.
+   */
+  private async enqueueSubprocessCommand(
+    parentId: string,
+    subprocessId: string,
+    cmd: Command,
+  ): Promise<CommandResult> {
+    const s = this.sessions.get(parentId);
+    if (!s) {
+      return { error: `Session not found: ${parentId}` };
+    }
+
+    const prev = this.sessionQueues.get(parentId) ?? Promise.resolve({} as CommandResult);
+    const next = prev.then(async () => {
+      return s.handleSubprocessCommand(subprocessId, cmd);
+    });
+
+    this.sessionQueues.set(parentId, next.catch((err) => ({
+      error: `Session ${parentId} subprocess error: ${(err as Error).message}`,
     })));
 
     return next;
@@ -283,11 +345,16 @@ class Daemon {
   private listSessions(): CommandResult {
     const sessions: SessionInfo[] = [];
     for (const [id, session] of this.sessions) {
-      sessions.push({
+      const info: SessionInfo = {
         session_id: id,
         state: session.state,
         script: session.scriptPath ?? undefined,
-      });
+      };
+      const subResult = session.listSubprocesses();
+      if (subResult.subprocesses?.length) {
+        info.subprocesses = subResult.subprocesses;
+      }
+      sessions.push(info);
     }
     return { sessions, count: sessions.length };
   }

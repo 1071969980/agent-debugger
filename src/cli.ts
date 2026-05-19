@@ -111,6 +111,9 @@ function formatResult(result: CommandResult): string {
     return `Error: ${result.error}`;
   }
 
+  // Session ID (from start/attach)
+  const sessionId = result.session_id;
+
   // Session list
   if (result.sessions) {
     if (!result.sessions.length) {
@@ -119,7 +122,27 @@ function formatResult(result: CommandResult): string {
     const lines: string[] = [];
     for (const s of result.sessions) {
       const script = s.script ? `  script: ${s.script}` : "";
-      lines.push(`  ${s.session_id}  state: ${s.state}${script}`);
+      const subs = s.subprocesses?.length
+        ? `  (${s.subprocesses.length} subprocess${s.subprocesses.length > 1 ? "es" : ""})`
+        : "";
+      lines.push(`  ${s.session_id}  state: ${s.state}${script}${subs}`);
+      if (s.subprocesses) {
+        for (const sub of s.subprocesses) {
+          lines.push(`    ${s.session_id}/${sub.subprocess_id}  state: ${sub.state}`);
+        }
+      }
+    }
+    return lines.join("\n");
+  }
+
+  // Subprocess list
+  if (result.subprocesses && !result.sessions) {
+    if (!result.subprocesses.length) {
+      return "  No subprocesses.";
+    }
+    const lines: string[] = [`  Subprocesses (${result.count}):`];
+    for (const sub of result.subprocesses) {
+      lines.push(`    ${sub.subprocess_id}  state: ${sub.state}`);
     }
     return lines.join("\n");
   }
@@ -155,6 +178,7 @@ function formatResult(result: CommandResult): string {
   if (result.location) {
     const loc = result.location;
     const out: string[] = [];
+    if (sessionId) out.push(`Session ID: ${sessionId}`);
     if (result.status) {
       const reason = result.reason ? ` (${result.reason})` : "";
       out.push(`Status: ${result.status}${reason}`);
@@ -231,21 +255,24 @@ function formatResult(result: CommandResult): string {
 
   // Running (e.g. after attach — breakpoints set, waiting for trigger)
   if (result.status === "running") {
-    const out: string[] = ["Attached. Program is running."];
+    const out: string[] = [];
+    if (sessionId) out.push(`Session ID: ${sessionId}`);
+    out.push("Attached. Program is running.");
     if (result.breakpoints) {
       for (const bp of result.breakpoints) {
         const v = bp.verified ? "verified" : "pending";
         out.push(`  Breakpoint: ${bp.file}:${bp.line} (${v})`);
       }
     }
-    out.push("  Run 'agent-debugger continue' to wait for a breakpoint hit.");
+    out.push("  Background monitoring active. Check state with 'agent-debugger status'.");
     return out.join("\n");
   }
 
   // Terminated
   if (result.status === "terminated") {
     const exitStr = result.exitCode !== undefined && result.exitCode !== null ? ` (exit code: ${result.exitCode})` : "";
-    return `Status: terminated${exitStr}`;
+    const prefix = sessionId ? `Session ID: ${sessionId}\n` : "";
+    return `${prefix}Status: terminated${exitStr}`;
   }
 
   // Closed
@@ -265,13 +292,13 @@ function formatResult(result: CommandResult): string {
 const HELP = `agent-debugger \u2014 CLI debugger for AI agents
 
 Usage:
-  agent-debugger start <script> [--break file:line]... [--catch [filter]] [--runtime path] [--args ...]
-  agent-debugger attach --pid <PID> [--break file:line]... [--catch [filter]]
-  agent-debugger attach [host:]port [--break file:line]... [--catch [filter]]
+  agent-debugger start <script> [-b file:line]... [--catch [filter]] [--runtime path] [--args ...]
+  agent-debugger attach --pid <PID> [-b file:line]... [--catch [filter]]
+  agent-debugger attach [host:]port [-b file:line]... [--catch [filter]]
   agent-debugger vars                        Get local variables
   agent-debugger eval <expression>           Evaluate expression
   agent-debugger step [into|out]             Step over/into/out
-  agent-debugger continue                    Continue / wait for next breakpoint
+  agent-debugger continue                    Resume execution (blocks until next stop)
   agent-debugger stack                       Show call stack
   agent-debugger break add <file:line[:cond]>  Add breakpoint
   agent-debugger break list                     List breakpoints
@@ -282,20 +309,31 @@ Usage:
   agent-debugger close                       Close a debug session
   agent-debugger list                        List all active sessions
   agent-debugger shutdown                    Shut down the daemon
+  agent-debugger subprocess list [--session <id>]  List subprocesses in a session
 
 Session targeting:
-  --session <id>       Target a specific session
+  --session <id>       Target a specific session or subprocess
+                      Use <session_id>/<subprocess_id> to target a subprocess
                       When only one session exists, it is used automatically.
                       When multiple sessions exist, --session is required.
 
-Exception breakpoints:
-  --catch [filter]     Pause on exceptions (repeatable)
-                       No argument = "uncaught" (default)
-                       Filter is passed to the DAP adapter directly.
-                       Python:  raised, uncaught, userUnhandled
-                       Node.js: all, uncaught
-                       Go:      all, uncaught
-                       Rust:    panic`;
+Start options:
+  -b, --break <file:line[:cond]>  Set a breakpoint (repeatable)
+  --catch [filter]                Pause on exceptions (repeatable, default: uncaught)
+  --runtime <path>                Path to language runtime (e.g. python, node)
+  --stop-on-entry                 Pause on the first line
+  --args <...>                    Arguments to pass to the script
+
+Attach options:
+  --pid <PID>                     Attach to a running process by PID
+  --runtime <path>                Path to language runtime
+  --language <name>               Language adapter (default: python)
+
+Exception filters (language-specific):
+  Python:  raised, uncaught, userUnhandled
+  Node.js: all, uncaught
+  Go:      all, uncaught
+  Rust:    panic`;
 
 /** Extract --session <id> from args and return remaining args. */
 function extractSessionId(args: string[]): { sessionId?: string; rest: string[] } {
@@ -336,6 +374,17 @@ async function main(): Promise<void> {
     case "shutdown":
       result = await sendCommand({ action: "shutdown" });
       break;
+
+    case "subprocess": {
+      const sub = args[1];
+      if (!sub || sub === "list") {
+        result = await sendCommand({ action: "subprocess", sub: "list" }, cliSessionId);
+      } else {
+        process.stderr.write(`Error: unknown subprocess subcommand '${sub}'. Use: list\n`);
+        process.exit(1);
+      }
+      break;
+    }
 
     case "start": {
       if (args.length < 2) {

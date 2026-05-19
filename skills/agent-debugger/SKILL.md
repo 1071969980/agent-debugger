@@ -54,7 +54,7 @@ agent-debugger attach [host:]port [--break file:line] [--catch [filter]]    # At
 agent-debugger eval <expression>        # Run any expression in the current frame
 agent-debugger vars                     # List local variables (prefer eval)
 agent-debugger step [into|out]          # Step over / into function / out of function
-agent-debugger continue                 # Run to next breakpoint / wait for hit after attach
+agent-debugger continue                 # Resume execution (blocks until next stop)
 agent-debugger stack                    # Show call stack
 agent-debugger break add <file:line[:cond]>  # Add breakpoint mid-session
 agent-debugger break list                     # List all breakpoints
@@ -64,6 +64,7 @@ agent-debugger source                   # Show source around current line
 agent-debugger status                   # Show session state and location
 agent-debugger close                    # Close a debug session
 agent-debugger list                     # List all active sessions
+agent-debugger subprocess list          # List subprocesses in a session
 agent-debugger shutdown                 # Shut down the daemon
 ```
 
@@ -77,6 +78,15 @@ agent-debugger --session a1b2c3d4 vars               # target specific session
 agent-debugger --session a1b2c3d4 close              # close one session
 agent-debugger shutdown                              # stop the daemon
 ```
+
+For subprocess debugging (os.fork, multiprocessing), use `<session_id>/<subprocess_id>` to target a specific subprocess:
+
+```bash
+agent-debugger subprocess list                       # show subprocesses in current session
+agent-debugger --session a1b2c3d4/p12345 vars        # debug a specific subprocess
+```
+
+Breakpoints added in the parent session are automatically propagated to all subprocesses. No manual sync needed.
 
 Multiple `--break` flags supported. Conditions are expressions: `--break "app.py:42:len(items) > 10"`.
 
@@ -111,16 +121,19 @@ Before anything else, decide how to connect:
 - **The process is already running** (server, daemon, worker, long-lived service) → `attach --pid`. Always. Don't restart it — you'll lose the state you need to inspect.
 - **You need to run a script from scratch** (CLI tool, test file, one-off script) → `start <script>`.
 
-If you're debugging a web server (uvicorn, Flask, FastAPI, Django, Express, etc.), a background worker, or any long-running process — `attach` is the default, not `start`. Find the PID, attach, set breakpoints, trigger the code path, inspect.
+If you're debugging a web server (uvicorn, Flask, FastAPI, Django, Express, etc.), a background worker, or any long-running process — `attach` is the default, not `start`. Find the PID, attach, set breakpoints, then exercise the code path.
 
 ```bash
 # Running server? Attach.
 ps aux | grep uvicorn
 agent-debugger attach --pid 12345 --break routes.py:42
-curl localhost:8000/api/endpoint        # trigger the breakpoint
-agent-debugger continue                 # wait for hit
+# ...exercise the code path (send request, etc.)...
+agent-debugger status                   # check if breakpoint was hit (non-blocking)
 agent-debugger eval "request.body"
 agent-debugger close                    # detaches without killing the server
+
+# Or block until the next hit:
+agent-debugger continue                 # resumes and blocks until next stop
 
 # Script you need to run? Start.
 agent-debugger start app.py --break "app.py:25"
@@ -253,14 +266,14 @@ Don't fix the symptom at the handler. Fix the cause at the loader.
 Set breakpoints at all suspects. The runtime tells you which one fires.
 
 ```bash
-# Running server — attach, arm breakpoints, trigger the request
+# Running server — attach, set breakpoints, exercise the code path
 ps aux | grep uvicorn
 agent-debugger attach --pid 12345 \
   --break "auth.py:30" \
   --break "validate.py:55" \
   --break "handler.py:80"
-curl localhost:8000/api/endpoint
-agent-debugger continue
+# ...exercise the code path...
+agent-debugger status                   # see which breakpoint was hit
 
 # Hits validate.py:55 — now you know where to focus
 agent-debugger eval "request.payload"

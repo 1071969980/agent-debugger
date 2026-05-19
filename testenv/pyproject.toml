@@ -1,0 +1,8 @@
+[project]
+name = "testenv"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.13"
+dependencies = [
+    "debugpy>=1.8.20",
+]

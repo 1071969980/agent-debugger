@@ -1,35 +1,39 @@
 /** Debug session state machine + command handlers. */
 
-import { readFileSync } from "node:fs";
 import { resolve as pathResolve, dirname } from "node:path";
 import type { ChildProcess } from "node:child_process";
 import { DAPClient } from "./dap-client.js";
-import type { AdapterConfig } from "./adapters/base.js";
+import type { AdapterConfig, SubprocessInfo } from "./adapters/base.js";
 import { getAdapterForFile, getAdapter } from "./adapters/registry.js";
-import type { Command, CommandResult, LocationInfo, VariableInfo, ExceptionDetail, BreakpointInfo } from "./protocol.js";
+import { SubprocessSession } from "./subprocess-session.js";
+import { DebugController } from "./debug-controller.js";
+import { generateSessionId } from "./util/paths.js";
+import type { Command, CommandResult } from "./protocol.js";
 
 export type SessionState = "idle" | "starting" | "running" | "paused" | "terminated";
 
 export class Session {
-  state: SessionState = "idle";
+  private _state: SessionState = "idle";
+  get state(): SessionState {
+    return this.controller?.state ?? this._state;
+  }
   private client: DAPClient | null = null;
   private adapter: AdapterConfig | null = null;
   private adapterProcess: ChildProcess | null = null;
-  private threadId: number | null = null;
-  private frameId: number | null = null;
   private _scriptPath: string | null = null;
   /** Path of the debugged script (set in launch mode). */
   get scriptPath(): string | null { return this._scriptPath; }
   /** True when connected via attach (don't kill the debuggee on close). */
   private attachedMode = false;
-  /** Background event loop handle — monitors for stopped/terminated while running. */
-  private bgLoop: Promise<void> | null = null;
-  /** Flag to signal the background event loop to stop. */
-  private bgLoopAbort = false;
-  /** Stop reason captured by the background event loop, consumed by waitForStop. */
-  private bgStopReason: string | null = null;
-  /** Tracked breakpoints: file path → [{ line, condition }]. */
-  private breakpoints = new Map<string, Array<{ line: number; condition: string | null }>>();
+  /** Subprocess sessions managed by this parent session. */
+  private subprocessSessions = new Map<string, SubprocessSession>();
+  /** Stored runtime path for spawning subprocess adapters later. */
+  private runtimePath: string | undefined;
+  /** Connection host/port for startDebugging reverse request subprocess handling. */
+  private connectHost: string | null = null;
+  private connectPort: number | null = null;
+  /** Debug controller — created after client connects. */
+  private controller: DebugController | null = null;
 
   async handleCommand(cmd: Command): Promise<CommandResult> {
     switch (cmd.action) {
@@ -37,45 +41,26 @@ export class Session {
         return this.startSession(cmd);
       case "attach":
         return this.attachSession(cmd);
-      case "vars":
-        return this.getVariables();
-      case "stack":
-        return this.getStack();
-      case "eval":
-        return this.evalExpression(cmd.expression);
-      case "step":
-        return this.step(cmd.kind || "over");
-      case "continue":
-        return this.continueExecution();
-      case "break": {
-        const breakCmd = cmd as Extract<Command, { action: "break" }>;
-        switch (breakCmd.sub) {
-          case "add": return this.addBreakpoint(breakCmd.file!, breakCmd.line!, breakCmd.condition);
-          case "list": return this.listBreakpoints();
-          case "rm": return this.removeBreakpoint(breakCmd.file!, breakCmd.line!);
-          case "clear": return this.clearBreakpoints();
-        }
-      }
-      case "source":
-        return this.getSourceAsync(cmd.file, cmd.line);
-      case "status":
-        return this.getStatus();
       case "close":
         return this.close();
       case "list":
       case "shutdown":
+      case "subprocess":
         return { error: `Action '${cmd.action}' is handled by the daemon, not a session` };
+      default:
+        if (!this.controller) return { error: "No active debug session" };
+        return this.controller.handleCommand(cmd);
     }
   }
 
   private async startSession(cmd: Extract<Command, { action: "start" }>): Promise<CommandResult> {
-    if (this.state !== "idle") {
+    if (this._state !== "idle") {
       return { error: "Session already active. Run 'agent-debugger close' first." };
     }
 
     const script = pathResolve(cmd.script);
     this._scriptPath = script;
-    this.state = "starting";
+    this._state = "starting";
 
     // Detect language and get adapter
     const language = cmd.language;
@@ -85,18 +70,19 @@ export class Session {
       this.adapter = getAdapterForFile(script);
     }
     if (!this.adapter) {
-      this.state = "idle";
+      this._state = "idle";
       return { error: `Unsupported file type: ${script}. Supported: .py, .js, .ts, .go, .rs, .c, .cpp` };
     }
 
     // Check adapter is installed
     const installErr = await this.adapter.checkInstalled(cmd.runtime);
     if (installErr) {
-      this.state = "idle";
+      this._state = "idle";
       return { error: installErr };
     }
 
     // Spawn debug adapter
+    let adapterPort: number;
     try {
       const spawnResult = await this.adapter.spawn({
         program: script,
@@ -106,17 +92,27 @@ export class Session {
         runtimePath: cmd.runtime,
       });
       this.adapterProcess = spawnResult.process;
+      adapterPort = spawnResult.port;
 
       // Connect DAP client
       this.client = new DAPClient();
-      await this.client.connect("127.0.0.1", spawnResult.port);
+      await this.client.connect("127.0.0.1", adapterPort);
     } catch (err) {
-      this.state = "idle";
+      this._state = "idle";
       return { error: `Failed to start debug adapter: ${(err as Error).message}` };
     }
 
+    // Create debug controller (start in "starting" state until initFlow completes)
+    this.controller = new DebugController(this.client, this.adapter, "starting", {
+      onBreakpointsChanged: (file) => this.broadcastBreakpoints(file),
+      bgExtraHandler: () => this.handleSubprocessEvents(),
+    });
+
     // Parse breakpoints
     const breakpoints = this.parseBreakpoints(cmd.breakpoints || []);
+    this.runtimePath = cmd.runtime;
+    this.connectHost = "127.0.0.1";
+    this.connectPort = adapterPort;
 
     // Run adapter-specific init flow
     const result = await this.adapter.initFlow(this.client, {
@@ -125,45 +121,47 @@ export class Session {
       cwd: cmd.cwd || dirname(script),
       stopOnEntry: cmd.stop_on_entry,
       runtimePath: cmd.runtime,
+      host: "127.0.0.1",
+      port: adapterPort,
       breakpoints,
       exceptionFilters: cmd.exception_filters,
+      onSubprocess: (info) => { this.registerSubprocess(info); },
     });
 
     if (result.error) {
-      this.state = "idle";
+      this._state = "idle";
       await this.cleanup();
       return result;
     }
 
     if (result.status === "paused") {
-      this.state = "paused";
+      this.controller.setState("paused");
       const body = (this.client.drainEvents("stopped")[0]?.body || {}) as { threadId?: number };
-      this.threadId = body.threadId ?? 1;
-      // threadId may already be set from the initFlow stopped event processing
-      // Try to get it from the adapter's result or fallback
-      if (!this.threadId) this.threadId = 1;
-      await this.updateFrame();
-      result.location = await this.currentLocation();
+      this.controller.setThreadId(body.threadId ?? 1);
+      await this.controller.updateFrame();
+      result.location = await this.controller.currentLocation();
       if (result.reason && result.reason !== "breakpoint" && result.reason !== "step") {
-        result.exception = await this.fetchExceptionInfo();
+        result.exception = await this.controller.fetchExceptionInfo();
       }
+      // Drain any startDebugging reverse requests that arrived during init
+      await this.handleSubprocessEvents();
     } else if (result.status === "terminated") {
-      this.state = "terminated";
+      this.controller.setState("terminated");
     } else {
-      this.state = "running";
-      this.startBgEventLoop();
+      this.controller.setState("running");
+      this.controller.startBgEventLoop(() => this.handleSubprocessEvents());
     }
 
     // Load initial breakpoints into tracker
     if (result.breakpoints) {
-      this.loadTrackedBreakpoints(result.breakpoints);
+      this.controller.loadTrackedBreakpoints(result.breakpoints);
     }
 
     return result;
   }
 
   private async attachSession(cmd: Extract<Command, { action: "attach" }>): Promise<CommandResult> {
-    if (this.state !== "idle") {
+    if (this._state !== "idle") {
       return { error: "Session already active. Run 'agent-debugger close' first." };
     }
 
@@ -171,18 +169,18 @@ export class Session {
       return { error: "Either port or --pid is required" };
     }
 
-    this.state = "starting";
+    this._state = "starting";
 
     // Get adapter (default to python)
     const language = cmd.language || "python";
     this.adapter = getAdapter(language);
     if (!this.adapter) {
-      this.state = "idle";
+      this._state = "idle";
       return { error: `Unknown language: ${language}` };
     }
 
     if (!this.adapter.attachFlow) {
-      this.state = "idle";
+      this._state = "idle";
       return { error: `Attach not supported for ${this.adapter.name}` };
     }
 
@@ -192,17 +190,16 @@ export class Session {
     // PID mode: inject debugpy into the running process (lldb on macOS, gdb on Linux)
     if (cmd.pid) {
       if (!this.adapter.inject) {
-        this.state = "idle";
+        this._state = "idle";
         return { error: `PID injection not supported for ${this.adapter.name}` };
       }
 
       try {
-        // inject() auto-detects the Python runtime and installs debugpy if needed
         const injectResult = await this.adapter.inject(cmd.pid, cmd.runtime);
         port = injectResult.debuggeePort ?? injectResult.port;
         host = "127.0.0.1";
       } catch (err) {
-        this.state = "idle";
+        this._state = "idle";
         return { error: `Failed to inject into PID ${cmd.pid}: ${(err as Error).message}` };
       }
     }
@@ -212,13 +209,24 @@ export class Session {
       this.client = new DAPClient();
       await this.client.connect(host, port!);
     } catch (err) {
-      this.state = "idle";
+      this._state = "idle";
       this.client = null;
       return { error: `Failed to connect to ${host}:${port}: ${(err as Error).message}` };
     }
 
+    // Create debug controller (start in "starting" state until attachFlow completes)
+    this.controller = new DebugController(this.client, this.adapter, "starting", {
+      onBreakpointsChanged: (file) => this.broadcastBreakpoints(file),
+      bgExtraHandler: () => this.handleSubprocessEvents(),
+    });
+
+    // Store connection info for startDebugging reverse requests
+    this.connectHost = host;
+    this.connectPort = port!;
+
     // Parse breakpoints
     const breakpoints = this.parseBreakpoints(cmd.breakpoints || []);
+    this.runtimePath = cmd.runtime;
 
     // Run adapter-specific attach flow
     const result = await this.adapter.attachFlow(this.client, {
@@ -227,22 +235,23 @@ export class Session {
       runtimePath: cmd.runtime,
       breakpoints,
       exceptionFilters: cmd.exception_filters,
+      onSubprocess: (info) => { this.registerSubprocess(info); },
     });
 
     if (result.error) {
-      this.state = "idle";
+      this._state = "idle";
       await this.cleanup();
       return result;
     }
 
     // After attach, program is running (breakpoints set, waiting for trigger)
-    this.state = "running";
+    this.controller.setState("running");
     this.attachedMode = true;
-    this.startBgEventLoop();
+    this.controller.startBgEventLoop(() => this.handleSubprocessEvents());
 
     // Load initial breakpoints into tracker
     if (result.breakpoints) {
-      this.loadTrackedBreakpoints(result.breakpoints);
+      this.controller.loadTrackedBreakpoints(result.breakpoints);
     }
 
     return result;
@@ -275,480 +284,109 @@ export class Session {
     }));
   }
 
-  /** Load adapter-reported breakpoints into the session tracker. */
-  private loadTrackedBreakpoints(bps: Array<{ file: string; line: number; verified?: boolean; condition?: string | null }>): void {
-    for (const bp of bps) {
-      let list = this.breakpoints.get(bp.file);
-      if (!list) {
-        list = [];
-        this.breakpoints.set(bp.file, list);
-      }
-      list.push({ line: bp.line, condition: bp.condition ?? null });
-    }
-  }
-
-  private async updateFrame(): Promise<void> {
-    if (!this.client || this.threadId === null) return;
-    const resp = await this.client.request("stackTrace", {
-      threadId: this.threadId,
-      startFrame: 0,
-      levels: 20,
-    });
-    if (resp.success && resp.body) {
-      const frames = (resp.body as { stackFrames?: Array<{ id: number }> }).stackFrames;
-      if (frames?.length) {
-        this.frameId = frames[0]!.id;
-      }
-    }
-  }
-
-  private async currentLocation(): Promise<LocationInfo | null> {
-    if (!this.client || this.threadId === null) return null;
-    const resp = await this.client.request("stackTrace", {
-      threadId: this.threadId,
-      startFrame: 0,
-      levels: 20,
-    });
-    if (resp.success && resp.body) {
-      const frames = (resp.body as {
-        stackFrames?: Array<{
-          name: string;
-          line: number;
-          source?: { path?: string };
-        }>;
-      }).stackFrames;
-      if (frames?.length) {
-        const f = frames[0]!;
-        return {
-          file: f.source?.path || "?",
-          line: f.line,
-          function: f.name,
-        };
-      }
-    }
-    return null;
-  }
-
-  /** Fetch detailed exception info via DAP exceptionInfo request. */
-  private async fetchExceptionInfo(): Promise<ExceptionDetail | null> {
-    if (!this.client || this.threadId === null) return null;
-    try {
-      const resp = await this.client.request("exceptionInfo", { threadId: this.threadId });
-      if (!resp.success || !resp.body) return null;
-      const body = resp.body as {
-        exceptionId?: string;
-        description?: string;
-        breakMode?: string;
-        details?: {
-          message?: string;
-          typeName?: string;
-          fullTypeName?: string;
-          stackTrace?: string;
-          evaluateName?: string;
-        };
-      };
-      const details = body.details;
-      if (!details) return null;
-      return {
-        typeName: details.typeName || details.fullTypeName || body.exceptionId || "Unknown",
-        description: details.message || body.description || "",
-        stackTrace: details.stackTrace || "",
-      };
-    } catch {
-      return null;
-    }
-  }
-
-  private async getVariables(): Promise<CommandResult> {
-    if (this.state !== "paused") return { error: "Program is not paused" };
-    if (!this.client) return { error: "No active session" };
-
-    await this.updateFrame();
-    if (this.frameId === null) return { error: "No frame available" };
-
-    const resp = await this.client.request("scopes", { frameId: this.frameId });
-    if (!resp.success) return { error: "Failed to get scopes" };
-
-    const scopes = (resp.body as { scopes?: Array<{ name: string; variablesReference: number }> }).scopes || [];
-    const result: VariableInfo[] = [];
-
-    for (const scope of scopes) {
-      if (scope.name !== "Locals" && scope.name !== "Local") continue;
-      const varResp = await this.client.request("variables", {
-        variablesReference: scope.variablesReference,
-        count: 100,
-      });
-      if (varResp.success && varResp.body) {
-        const vars = (varResp.body as {
-          variables?: Array<{ name: string; value: string; type?: string; variablesReference: number }>;
-        }).variables || [];
-        for (const v of vars) {
-          if (this.adapter?.isInternalVariable(v as any)) continue;
-          result.push({ name: v.name, value: v.value, type: v.type || "" });
-        }
-      }
-    }
-
-    const location = await this.currentLocation();
-    return { variables: result, count: result.length, location };
-  }
-
-  private async getStack(): Promise<CommandResult> {
-    if (this.state !== "paused") return { error: "Program is not paused" };
-    if (!this.client || this.threadId === null) return { error: "No active session" };
-
-    const resp = await this.client.request("stackTrace", {
-      threadId: this.threadId,
-      startFrame: 0,
-      levels: 50,
-    });
-    if (!resp.success) return { error: "Failed to get stack trace" };
-
-    const rawFrames = (resp.body as {
-      stackFrames?: Array<{
-        id: number;
-        name: string;
-        line: number;
-        column: number;
-        source?: { path?: string };
-      }>;
-    }).stackFrames || [];
-
-    const frames: LocationInfo[] = [];
-    for (const f of rawFrames) {
-      if (this.adapter?.isInternalFrame(f as any)) continue;
-      frames.push({
-        function: f.name,
-        file: f.source?.path || "",
-        line: f.line,
-      });
-    }
-
-    return { frames, count: frames.length };
-  }
-
-  private async evalExpression(expression: string): Promise<CommandResult> {
-    if (this.state !== "paused") return { error: "Program is not paused" };
-    if (!this.client) return { error: "No active session" };
-    if (!expression) return { error: "No expression provided" };
-
-    const args: Record<string, unknown> = { expression, context: "repl" };
-    if (this.frameId !== null) args.frameId = this.frameId;
-
-    const resp = await this.client.request("evaluate", args);
-    if (resp.success && resp.body) {
-      const body = resp.body as { result: string; type?: string };
-      return { result: body.result, type: body.type || "" };
-    }
-    return { error: resp.message || "Evaluation failed" };
-  }
-
-  private async step(kind: string): Promise<CommandResult> {
-    if (this.state !== "paused") return { error: "Program is not paused" };
-    if (!this.client || this.threadId === null) return { error: "No active session" };
-
-    if (this.bgStopReason) {
-      return { error: "Program was paused by a background event. Run 'agent-debugger status' to inspect before stepping." };
-    }
-
-    const command = kind === "into" ? "stepIn" : kind === "out" ? "stepOut" : "next";
-    await this.client.request(command, { threadId: this.threadId });
-    this.state = "running";
-    this.startBgEventLoop();
-    return this.waitForStop();
-  }
-
-  private async continueExecution(): Promise<CommandResult> {
-    if (this.state === "running") {
-      // In running state (e.g. after attach), just wait for next breakpoint hit
-      if (!this.client) return { error: "No active session" };
-      return this.waitForStop();
-    }
-    if (this.state !== "paused") return { error: "Program is not paused" };
-    if (!this.client || this.threadId === null) return { error: "No active session" };
-
-    if (this.bgStopReason) {
-      return { error: "Program was paused by a background event. Run 'agent-debugger status' to inspect before continuing." };
-    }
-
-    await this.client.request("continue", { threadId: this.threadId });
-    this.state = "running";
-    this.startBgEventLoop();
-    return this.waitForStop();
-  }
-
-  private async waitForStop(): Promise<CommandResult> {
-    if (!this.client) return { error: "No active session" };
-
-    // Poll for stopped/terminated events
-    while (true) {
-      // If bg loop already transitioned state, return immediately
-      if (this.state === "paused") {
-        const reason = this.bgStopReason;
-        this.bgStopReason = null;
-        const loc = await this.currentLocation();
-        const exception = reason !== "breakpoint" ? await this.fetchExceptionInfo() : null;
-        return {
-          status: "paused",
-          reason: reason || "breakpoint",
-          location: loc,
-          exception,
-        };
-      }
-      if (this.state === "terminated") {
-        return { status: "terminated" };
-      }
-
-      const stopped = await this.client.waitForEvent("stopped", 1000);
-      if (stopped) {
-        this.state = "paused";
-        this.stopBgEventLoop();
-        const body = (stopped.body || {}) as { reason?: string; threadId?: number; text?: string; description?: string };
-        this.threadId = body.threadId ?? this.threadId;
-        await this.updateFrame();
-        const detail = body.reason === "exception" && body.text
-          ? `${body.text}: ${body.description || ""}`.trim()
-          : body.reason;
-        const exception = body.reason === "exception" ? await this.fetchExceptionInfo() : null;
-        return {
-          status: "paused",
-          reason: detail || "unknown",
-          location: await this.currentLocation(),
-          exception,
-        };
-      }
-
-      const terminated = this.client.drainEvents("terminated");
-      const exited = this.client.drainEvents("exited");
-      if (terminated.length || exited.length) {
-        this.state = "terminated";
-        let exitCode: number | null = null;
-        if (exited.length) {
-          exitCode = (exited[0]!.body as { exitCode?: number })?.exitCode ?? null;
-        }
-        return { status: "terminated", exitCode };
-      }
-
-      // Drain output events silently
-      this.client.drainEvents("output");
-    }
-  }
-
-  private async syncBreakpointsToFile(absPath: string): Promise<{ success: boolean; verified: boolean[] }> {
-    if (!this.client) return { success: false, verified: [] };
-    const list = this.breakpoints.get(absPath) || [];
-    const bpArgs: Record<string, unknown> = {
-      source: { path: absPath },
-      breakpoints: list.map(bp => {
-        const entry: Record<string, unknown> = { line: bp.line };
-        if (bp.condition) entry.condition = bp.condition;
-        return entry;
-      }),
-    };
-    const resp = await this.client.request("setBreakpoints", bpArgs);
-    if (!resp.success || !resp.body) return { success: false, verified: [] };
-    const bps = (resp.body as { breakpoints?: Array<{ line?: number; verified?: boolean }> }).breakpoints || [];
-    return { success: true, verified: bps.map(b => b.verified ?? false) };
-  }
-
-  private async addBreakpoint(filePath: string, line: number, condition?: string): Promise<CommandResult> {
-    if (!this.client) return { error: "No active session" };
-
-    const absPath = pathResolve(filePath);
-    let list = this.breakpoints.get(absPath);
-    if (list?.some(bp => bp.line === line)) {
-      return { error: `Breakpoint already exists at ${absPath}:${line}` };
-    }
-    if (!list) {
-      list = [];
-      this.breakpoints.set(absPath, list);
-    }
-    list.push({ line, condition: condition ?? null });
-
-    const sync = await this.syncBreakpointsToFile(absPath);
-    if (!sync.success) {
-      // rollback
-      list.pop();
-      if (list.length === 0) this.breakpoints.delete(absPath);
-      return { error: "Failed to set breakpoint" };
-    }
-
-    const idx = list.length - 1;
-    return { file: absPath, line, verified: sync.verified[idx] ?? false, condition: condition ?? null };
-  }
-
-  private listBreakpoints(): CommandResult {
-    const result: BreakpointInfo[] = [];
-    for (const [file, list] of this.breakpoints) {
-      for (const bp of list) {
-        result.push({ file, line: bp.line, verified: true, condition: bp.condition });
-      }
-    }
-    return { breakpoints: result, count: result.length };
-  }
-
-  private async removeBreakpoint(filePath: string, line: number): Promise<CommandResult> {
-    if (!this.client) return { error: "No active session" };
-
-    const absPath = pathResolve(filePath);
-    const list = this.breakpoints.get(absPath);
-    if (!list) return { error: `No breakpoints in ${absPath}` };
-
-    const idx = list.findIndex(bp => bp.line === line);
-    if (idx === -1) return { error: `No breakpoint at ${absPath}:${line}` };
-
-    list.splice(idx, 1);
-    if (list.length === 0) this.breakpoints.delete(absPath);
-
-    await this.syncBreakpointsToFile(absPath);
-    return { status: "removed", file: absPath, line };
-  }
-
-  private async clearBreakpoints(): Promise<CommandResult> {
-    if (!this.client) return { error: "No active session" };
-
-    let count = 0;
-    for (const file of this.breakpoints.keys()) {
-      count += this.breakpoints.get(file)!.length;
-      this.breakpoints.set(file, []);
-      await this.syncBreakpointsToFile(file);
-    }
-    this.breakpoints.clear();
-    return { status: "cleared", count };
-  }
-
-  private async getSourceAsync(filePath?: string, line?: number): Promise<CommandResult> {
-    let resolvedFile = filePath;
-    let resolvedLine = line;
-
-    if (!resolvedFile && this.state === "paused") {
-      const loc = await this.currentLocation();
-      if (loc) {
-        resolvedFile = loc.file;
-        resolvedLine = resolvedLine ?? loc.line;
-      }
-    }
-
-    if (!resolvedFile) {
-      return { error: "No file specified and not paused at a known location" };
-    }
-
-    resolvedFile = pathResolve(resolvedFile);
-
-    let lines: string[];
-    try {
-      lines = readFileSync(resolvedFile, "utf-8").split("\n");
-    } catch {
-      return { error: `File not found: ${resolvedFile}` };
-    }
-
-    const center = (resolvedLine || 1) - 1;
-    const start = Math.max(0, center - 5);
-    const end = Math.min(lines.length, center + 6);
-    const sourceLines: string[] = [];
-    for (let i = start; i < end; i++) {
-      const marker = i === center ? "\u2192" : " ";
-      const lineNum = String(i + 1).padStart(4);
-      sourceLines.push(`${marker} ${lineNum} \u2502 ${lines[i]}`);
-    }
-
-    return { file: resolvedFile, line: resolvedLine, source: sourceLines.join("\n") };
-  }
-
-  private getStatus(): CommandResult {
-    return {
-      state: this.state,
-      location: null, // Will be populated by async caller if needed
-    };
-  }
-
-  async getStatusAsync(): Promise<CommandResult> {
-    if (this.state === "paused") {
-      const reason = this.bgStopReason;
-      if (reason) {
-        this.bgStopReason = null;
-        return {
-          status: "paused",
-          reason,
-          exception: await this.fetchExceptionInfo(),
-          location: await this.currentLocation(),
-        };
-      }
-      return { state: this.state, location: await this.currentLocation() };
-    }
-    return { state: this.state };
-  }
-
   async close(): Promise<CommandResult> {
-    this.stopBgEventLoop();
+    if (this.controller) {
+      this.controller.stopBgEventLoop();
+    }
     await this.cleanup();
-    this.state = "idle";
-    this.threadId = null;
-    this.frameId = null;
+    this._state = "idle";
+    this.controller = null;
     this._scriptPath = null;
     this.attachedMode = false;
-    this.breakpoints.clear();
+    this.connectHost = null;
+    this.connectPort = null;
     return { status: "closed" };
   }
 
-  /**
-   * Background event loop: monitors DAP events while the program is running.
-   * Automatically transitions session state when stopped/terminated events arrive,
-   * so `status` and `stack` reflect the real program state without requiring `continue`.
-   */
-  private startBgEventLoop(): void {
-    if (this.bgLoop || !this.client) return;
-    this.bgLoopAbort = false;
-
-    this.bgLoop = (async () => {
-      while (!this.bgLoopAbort && this.client && this.state === "running") {
-        const stopped = await this.client.waitForEvent("stopped", 1000);
-        if (this.bgLoopAbort) break;
-
-        if (stopped) {
-          this.state = "paused";
-          const body = (stopped.body || {}) as { reason?: string; threadId?: number; text?: string; description?: string };
-          this.threadId = body.threadId ?? this.threadId;
-          this.bgStopReason = body.reason === "exception" && body.text
-            ? `${body.text}: ${body.description || ""}`.trim()
-            : (body.reason || "unknown");
-          await this.updateFrame();
-          return; // pause the bg loop — continueExecution will restart it
-        }
-
-        const terminated = this.client.drainEvents("terminated");
-        const exited = this.client.drainEvents("exited");
-        if (terminated.length || exited.length) {
-          this.state = "terminated";
-          return;
-        }
-
-        this.client.drainEvents("output");
-      }
-    })().catch(() => { /* swallow — bg loop errors are not fatal */ });
+  /** Register a subprocess adapter as a full debug session. */
+  private registerSubprocess(info: SubprocessInfo): void {
+    const id = info.pid != null ? `p${info.pid}` : generateSessionId();
+    if (this.subprocessSessions.has(id)) return; // dedup
+    const sub = new SubprocessSession({
+      subprocessId: id,
+      client: info.client,
+      adapter: this.adapter!,
+      adapterProcess: info.process,
+    });
+    this.subprocessSessions.set(id, sub);
+    sub.start();
   }
 
-  private stopBgEventLoop(): void {
-    this.bgLoopAbort = true;
-    this.bgLoop = null;
-    this.bgStopReason = null;
+  /** Route a command to a specific subprocess session. */
+  async handleSubprocessCommand(subprocessId: string, cmd: Command): Promise<CommandResult> {
+    const sub = this.subprocessSessions.get(subprocessId);
+    if (!sub) {
+      return { error: `Subprocess '${subprocessId}' not found in session` };
+    }
+
+    const result = await sub.handleCommand(cmd);
+
+    // Auto-cleanup terminated subprocess
+    if (sub.terminated) {
+      this.subprocessSessions.delete(subprocessId);
+    }
+
+    return result;
+  }
+
+  /** List all subprocesses in this session. */
+  listSubprocesses(): CommandResult {
+    const subprocesses: Array<{ subprocess_id: string; state: string }> = [];
+    for (const [id, sub] of this.subprocessSessions) {
+      subprocesses.push({ subprocess_id: id, state: sub.state });
+    }
+    return { subprocesses, count: subprocesses.length };
+  }
+
+  /** Propagate breakpoint changes to all subprocess sessions. */
+  private async broadcastBreakpoints(file: string): Promise<void> {
+    const allBps = this.controller!.getCurrentBreakpoints();
+    const fileBps = allBps.find(bp => bp.file === file);
+    if (!fileBps) return;
+    for (const [, sub] of this.subprocessSessions) {
+      try {
+        await sub.syncBreakpointsFromFile(file, fileBps);
+      } catch (err) {
+        process.stderr.write(`agent-debugger: bp sync error: ${(err as Error).message}\n`);
+      }
+    }
+  }
+
+  /** Handle subprocess events from the bg event loop. */
+  private async handleSubprocessEvents(): Promise<void> {
+    if (!this.controller || !this.client || !this.adapter) return;
+    if (!this.adapter.drainSubprocessEvents) return;
+
+    await this.adapter.drainSubprocessEvents(this.client, {
+      host: this.connectHost ?? undefined,
+      port: this.connectPort ?? undefined,
+      runtimePath: this.runtimePath,
+      breakpoints: this.controller.getCurrentBreakpoints(),
+      exceptionFilters: [],
+      onSubprocess: (info) => { this.registerSubprocess(info); },
+    });
   }
 
   private async cleanup(): Promise<void> {
-    if (this.client) {
+    // Clean up subprocess sessions
+    for (const [, sub] of this.subprocessSessions) {
+      try { await sub.close(); } catch { /* best effort */ }
+    }
+    this.subprocessSessions.clear();
+
+    if (this.controller) {
       try {
-        // In attach mode, disconnect without terminating the debuggee
-        await this.client.disconnect(!this.attachedMode);
+        await this.controller.disconnect(!this.attachedMode);
       } catch {
         // Best effort
       }
-      this.client = null;
+      this.controller = null;
     }
+    this.client = null;
 
     if (this.adapterProcess) {
       try {
         this.adapterProcess.kill("SIGTERM");
-        // Give it a moment to exit gracefully
         await new Promise<void>((resolve) => {
           const timer = setTimeout(() => {
             try { this.adapterProcess?.kill("SIGKILL"); } catch { /* ignore */ }

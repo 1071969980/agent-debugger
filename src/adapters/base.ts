@@ -19,9 +19,19 @@ export interface LaunchOpts {
   runtimePath?: string;
 }
 
+export interface SubprocessInfo {
+  process?: ChildProcess;
+  client: DAPClient;
+  pid?: number;
+}
+
 export interface InitFlowOpts extends LaunchOpts {
+  host?: string;
+  port?: number;
   breakpoints?: Array<{ file: string; lines: number[]; conditions?: Array<string | null> }>;
   exceptionFilters?: string[];
+  /** Called when a subprocess adapter is spawned (Python/debugpy subProcess support). */
+  onSubprocess?: (info: SubprocessInfo) => void;
 }
 
 export interface AttachFlowOpts {
@@ -31,6 +41,8 @@ export interface AttachFlowOpts {
   runtimePath?: string;
   breakpoints?: Array<{ file: string; lines: number[]; conditions?: Array<string | null> }>;
   exceptionFilters?: string[];
+  /** Called when a subprocess adapter is spawned (Python/debugpy subProcess support). */
+  onSubprocess?: (info: SubprocessInfo) => void;
 }
 
 export interface InjectResult {
@@ -39,6 +51,15 @@ export interface InjectResult {
   port: number;
   /** Port where debugpy is listening inside the debuggee (for adapter routing). */
   debuggeePort?: number;
+}
+
+export interface SubprocessDrainOpts {
+  host?: string;
+  port?: number;
+  runtimePath?: string;
+  breakpoints?: Array<{ file: string; lines: number[]; conditions?: Array<string | null> }>;
+  exceptionFilters?: string[];
+  onSubprocess?: (info: SubprocessInfo) => void;
 }
 
 export interface AdapterConfig {
@@ -79,4 +100,7 @@ export interface AdapterConfig {
 
   /** Filter internal variables (e.g. __dunder__ vars). */
   isInternalVariable(v: Variable): boolean;
+
+  /** Drain pending subprocess events from the DAP client. */
+  drainSubprocessEvents?(client: DAPClient, opts: SubprocessDrainOpts): Promise<void>;
 }

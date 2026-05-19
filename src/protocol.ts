@@ -70,6 +70,10 @@ export const StatusCommand = z.object({ action: z.literal("status") });
 export const CloseCommand = z.object({ action: z.literal("close") });
 export const ListCommand = z.object({ action: z.literal("list") });
 export const ShutdownCommand = z.object({ action: z.literal("shutdown") });
+export const SubprocessCommand = z.object({
+  action: z.literal("subprocess"),
+  sub: z.literal("list"),
+});
 
 export const Command = z.discriminatedUnion("action", [
   StartCommand,
@@ -85,6 +89,7 @@ export const Command = z.discriminatedUnion("action", [
   CloseCommand,
   ListCommand,
   ShutdownCommand,
+  SubprocessCommand,
 ]);
 
 export type Command = z.infer<typeof Command>;
@@ -110,11 +115,18 @@ export interface VariableInfo {
   type: string;
 }
 
+export interface SubprocessEntry {
+  subprocess_id: string;
+  state: string;
+  pid?: number;
+}
+
 export interface SessionInfo {
   session_id: string;
   state: string;
   script?: string;
   pid?: number;
+  subprocesses?: SubprocessEntry[];
 }
 
 export interface ExceptionDetail {
@@ -145,4 +157,5 @@ export interface CommandResult {
   message?: string;
   sessions?: SessionInfo[];
   exception?: ExceptionDetail | null;
+  subprocesses?: SubprocessEntry[];
 }

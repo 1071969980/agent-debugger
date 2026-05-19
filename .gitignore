@@ -6,3 +6,4 @@ dist/
 npm-debug.log*
 .env
 .env.local
+testenv/.venv/
