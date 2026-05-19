@@ -307,3 +307,7 @@ CLI  ──unix socket──▶  Daemon  ──TCP/DAP──▶  Your Server
 - **Debug Adapter**: Language-specific process (debugpy, Delve, js-debug, CodeLLDB) that implements the Debug Adapter Protocol.
 
 The daemon starts automatically on the first command. Multiple debug sessions can run concurrently. Use `agent-debugger shutdown` to stop the daemon.
+
+## ROADMAP
+
+[view the roadmap](./docs/docs/roadmap.md)
