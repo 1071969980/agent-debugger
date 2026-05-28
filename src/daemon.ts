@@ -44,20 +44,20 @@ class Daemon {
     setInterval(() => this.cleanupTerminated(), 60_000).unref();
 
     // Graceful shutdown
-    const shutdown = (signal: string) => {
+    const shutdown = async (signal: string) => {
       if (this.isShuttingDown) return;
       this.isShuttingDown = true;
       process.stderr.write(`Daemon received ${signal}, shutting down...\n`);
-      this.cleanup();
+      await this.cleanup();
     };
 
     process.on("SIGTERM", () => {
       shutdown("SIGTERM");
-      setTimeout(() => process.exit(1), 5_000).unref();
+      setTimeout(() => process.exit(1), 30_000).unref();
     });
     process.on("SIGINT", () => {
       shutdown("SIGINT");
-      setTimeout(() => process.exit(1), 5_000).unref();
+      setTimeout(() => process.exit(1), 30_000).unref();
     });
     process.on("uncaughtException", (err) => {
       process.stderr.write(`Daemon uncaught exception: ${err.message}\n`);
@@ -139,7 +139,7 @@ class Daemon {
           break;
         case "shutdown":
           this.sendResponse(conn, { status: "shutdown" });
-          setTimeout(() => this.cleanup(), 100);
+          await this.cleanup();
           return;
         case "start":
           result = await this.handleStart(cmd);
@@ -368,10 +368,11 @@ class Daemon {
     }
   }
 
-  private cleanup(): void {
-    for (const [, session] of this.sessions) {
-      session.close().catch(() => {});
-    }
+  private async cleanup(): Promise<void> {
+    const closePromises = Array.from(this.sessions.values()).map(s =>
+      s.close().catch(() => {}),
+    );
+    await Promise.all(closePromises);
     this.sessions.clear();
 
     if (this.server) {
