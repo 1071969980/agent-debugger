@@ -308,6 +308,7 @@ export class Session {
       client: info.client,
       adapter: this.adapter!,
       adapterProcess: info.process,
+      attachedMode: this.attachedMode,
     });
     this.subprocessSessions.set(id, sub);
     sub.start();

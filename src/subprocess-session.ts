@@ -20,14 +20,18 @@ export class SubprocessSession {
     return this.controller.terminated;
   }
 
+  private attachedMode: boolean;
+
   constructor(opts: {
     subprocessId: string;
     client: DAPClient;
     adapter: AdapterConfig;
     adapterProcess?: ChildProcess;
+    attachedMode?: boolean;
   }) {
     this.id = opts.subprocessId;
     this.adapterProcess = opts.adapterProcess;
+    this.attachedMode = opts.attachedMode ?? false;
     this.controller = new DebugController(opts.client, opts.adapter);
   }
 
@@ -64,7 +68,7 @@ export class SubprocessSession {
 
   private async cleanup(): Promise<void> {
     try {
-      await this.controller.disconnect(true);
+      await this.controller.disconnect(!this.attachedMode);
     } catch {
       // Best effort
     }
