@@ -323,6 +323,7 @@ Session targeting:
 
 Common options:
   --wait, -w                       Block until next stop (continue/step)
+  --force, -f                      Override background event guard (continue/step)
 
 Start options:
   -b, --break <file:line[:cond]>  Set a breakpoint (repeatable)
@@ -546,12 +547,17 @@ async function main(): Promise<void> {
         }
         result = await sendCommand({ action: "eval", expression: expr }, sid);
       } else if (command === "step") {
-        const wait = args.includes("--wait") || args.includes("-w");
-        const kind = ["over", "into", "out"].includes(args[1] || "") ? args[1] : "over";
-        result = await sendCommand({ action: "step", kind, wait: wait || undefined }, sid);
+        const flags = args.filter(a => a.startsWith("-"));
+        const posArgs = args.filter(a => !a.startsWith("-"));
+        const wait = flags.includes("--wait") || flags.includes("-w");
+        const force = flags.includes("--force") || flags.includes("-f");
+        const kind = ["over", "into", "out"].includes(posArgs[1] || "") ? posArgs[1] : "over";
+        result = await sendCommand({ action: "step", kind, wait: wait || undefined, force: force || undefined }, sid);
       } else if (command === "continue" || command === "cont" || command === "c") {
-        const wait = args.includes("--wait") || args.includes("-w");
-        result = await sendCommand({ action: "continue", wait: wait || undefined }, sid);
+        const flags = args.filter(a => a.startsWith("-"));
+        const wait = flags.includes("--wait") || flags.includes("-w");
+        const force = flags.includes("--force") || flags.includes("-f");
+        result = await sendCommand({ action: "continue", wait: wait || undefined, force: force || undefined }, sid);
       } else if (command === "break" || command === "bp") {
         const sub = args[1];
         if (!sub || sub.startsWith("-")) {

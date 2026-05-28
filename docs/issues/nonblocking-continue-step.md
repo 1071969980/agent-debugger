@@ -2,48 +2,21 @@
 
 > 来源：`continue`/`step` 非阻塞重构 (multi-session 分支) 的代码审查
 
-## Medium — bg event loop 与 waitForStop 竞争
+## ~~Medium~~ ✅ 已修复 — bg event loop 与 waitForStop 竞争
 
-**文件**: `src/debug-controller.ts:52-83` vs `src/debug-controller.ts:499-551`
-
-**问题**: 非阻塞 `continue`/`step` 启动 bg event loop 监听 stopped 事件。之后用户调 `continue --wait`，进入 `waitForStop()` 也监听 stopped 事件。两者通过 `client.waitForEvent("stopped")` 竞争同一个 DAP 事件。
-
-**机制**: `stopBgEventLoop()` (line 87) 只设 `bgLoopAbort = true`，不会取消 bg loop 中正在 await 的 `waitForEvent`。bg loop 可能先消费 stopped 事件，导致 `waitForStop` 等到下一个 1s 超时轮次才发现 state 已变 paused，产生最多 1s 延迟。
-
-**虽然命令队列串行化避免了真正并发**，但时序上存在：
-1. 非阻塞 continue → 启动 bg loop → 返回
-2. 用户调 `continue --wait` → 命令队列等上条完成 → 进入 `waitForStop()`
-3. 此时 bg loop 的 `waitForEvent("stopped", 1000)` 已经在 pending
-4. `waitForStop` 也调 `waitForEvent("stopped", 1000)`
-5. 哪个先注册的 listener 先拿到事件
-
-**修复方向**: `wait=true` 时，在发 DAP continue/step 请求之前调用 `stopBgEventLoop()`，并让 bg loop 的 pending `waitForEvent` 能被中断。可以考虑给 `waitForEvent` 加 abort signal，或在 `stopBgEventLoop` 中注入一个 resolved 值。
+**修复**: `continue`/`step` 在发 DAP 请求前先调 `stopBgEventLoop()`，让 bg loop 的 pending `waitForEvent` 自然超时退出，避免两者同时竞争同一个 stopped 事件。
 
 ---
 
-## Medium — bgStopReason 导致 step/continue 死锁
+## ~~Medium~~ ✅ 已修复 — bgStopReason 导致 step/continue 死锁
 
-**文件**: `src/debug-controller.ts:327-329`, `src/debug-controller.ts:348-349`
+**修复**: 新增 `--force`/`-f` 标志（方案 C），可绕过 `bgStopReason` 守卫直接恢复执行。守卫错误消息更新为提示 `--force` 选项。
 
-**问题**: bg event loop 捕获 stopped 事件后设置 `bgStopReason`。之后用户调 `step` 或 `continue`，代码检查到 `bgStopReason` 非空，直接返回错误：
+---
 
-```
-"Paused by a background event. Run 'status' to inspect before stepping."
-```
+## ~~Low~~ ✅ 已修复 — step --wait into 参数顺序解析问题
 
-**只有 `getStatusAsync()` 会清除 `bgStopReason`** (line 403: `this.bgStopReason = null`)。如果用户不调 `status`，debugger 处于 paused 状态但拒绝所有 resume 命令。
-
-**典型场景**:
-- 用户用 `--catch` 启动，程序抛异常被 bg loop 捕获
-- 用户直接调 `eval` 检查变量 — 正常工作（eval 不检查 bgStopReason）
-- 用户调 `continue` — 被拒，要求先 `status`
-- 用户调 `status` — 看到异常信息，bgStopReason 被清
-- 用户再调 `continue` — 正常
-
-**修复方向**:
-- 方案 A: 在 `step`/`continue` 中自动清除 `bgStopReason`（去掉守卫）
-- 方案 B: 保留守卫但改为 warning 而非 error，自动清除并继续执行
-- 方案 C: 加 `--force` 标志绕过守卫
+**修复**: 改为先过滤 flags 再解析 positional args，`step --wait into` 现在正确解析为 kind=into, wait=true。
 
 ---
 
@@ -56,25 +29,6 @@
 **影响**: 无实际 bug — step 停止时没有 exception 可取，`fetchExceptionInfo` 返回 null。但逻辑不一致可能导致后续维护混乱。
 
 **修复**: 统一两处逻辑，提取为 `isExceptionReason(reason)` helper。
-
----
-
-## Low — step --wait into 参数顺序解析问题
-
-**文件**: `src/cli.ts:549-551`
-
-**问题**: `agent-debugger step --wait into` 会将 `into` 静默丢弃。当前解析：
-```typescript
-const wait = args.includes("--wait") || args.includes("-w");
-const kind = ["over", "into", "out"].includes(args[1] || "") ? args[1] : "over";
-```
-`args[1]` 是 `"--wait"`，不在 `["over", "into", "out"]` 中，kind 默认 `"over"`。
-
-**修复**: 先剥离 flags 再解析 positional args：
-```typescript
-const stepArgs = args.filter(a => a !== "--wait" && a !== "-w");
-const kind = ["over", "into", "out"].includes(stepArgs[1] || "") ? stepArgs[1] : "over";
-```
 
 ---
 

@@ -214,9 +214,9 @@ export class DebugController {
       case "eval":
         return this.evalExpression(cmd.expression);
       case "step":
-        return this.step(cmd.kind || "over", cmd.wait);
+        return this.step(cmd.kind || "over", cmd.wait, cmd.force);
       case "continue":
-        return this.continueExecution(cmd.wait);
+        return this.continueExecution(cmd.wait, cmd.force);
       case "break": {
         const breakCmd = cmd as Extract<Command, { action: "break" }>;
         switch (breakCmd.sub) {
@@ -320,15 +320,17 @@ export class DebugController {
     return { error: resp.message || "Evaluation failed" };
   }
 
-  private async step(kind: string, wait?: boolean): Promise<CommandResult> {
+  private async step(kind: string, wait?: boolean, force?: boolean): Promise<CommandResult> {
     if (this.state !== "paused") return { error: "Not paused" };
     if (this.threadId === null) return { error: "No thread" };
 
-    if (this.bgStopReason) {
-      return { error: "Paused by a background event. Run 'status' to inspect before stepping." };
+    if (this.bgStopReason && !force) {
+      return { error: "Paused by a background event. Run 'status' to inspect, or use --force to override." };
     }
+    this.bgStopReason = null;
 
     const command = kind === "into" ? "stepIn" : kind === "out" ? "stepOut" : "next";
+    this.stopBgEventLoop();
     await this.client.request(command, { threadId: this.threadId });
     this.state = "running";
 
@@ -338,17 +340,19 @@ export class DebugController {
     return { status: "running", message: "Resumed." };
   }
 
-  private async continueExecution(wait?: boolean): Promise<CommandResult> {
+  private async continueExecution(wait?: boolean, force?: boolean): Promise<CommandResult> {
     if (this.state === "running") {
       return wait ? this.waitForStop() : { status: "running", message: "Already running." };
     }
     if (this.state !== "paused") return { error: "Not paused" };
     if (this.threadId === null) return { error: "No thread" };
 
-    if (this.bgStopReason) {
-      return { error: "Paused by a background event. Run 'status' to inspect before continuing." };
+    if (this.bgStopReason && !force) {
+      return { error: "Paused by a background event. Run 'status' to inspect, or use --force to override." };
     }
+    this.bgStopReason = null;
 
+    this.stopBgEventLoop();
     await this.client.request("continue", { threadId: this.threadId });
     this.state = "running";
 
