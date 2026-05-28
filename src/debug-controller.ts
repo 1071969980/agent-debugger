@@ -17,7 +17,7 @@ export class DebugController {
   private bgLoopAbort = false;
   private bgStopReason: string | null = null;
   private bgExtraHandler?: () => Promise<void>;
-  private breakpoints = new Map<string, Array<{ line: number; condition: string | null }>>();
+  private breakpoints = new Map<string, Array<{ line: number; condition: string | null; verified: boolean }>>();
   private onBreakpointsChanged?: (file: string) => Promise<void>;
 
   get terminated(): boolean {
@@ -174,7 +174,7 @@ export class DebugController {
         list = [];
         this.breakpoints.set(bp.file, list);
       }
-      list.push({ line: bp.line, condition: bp.condition ?? null });
+      list.push({ line: bp.line, condition: bp.condition ?? null, verified: bp.verified ?? true });
     }
   }
 
@@ -198,7 +198,7 @@ export class DebugController {
     bps: { lines: number[]; conditions: Array<string | null> },
   ): Promise<void> {
     this.breakpoints.set(file, bps.lines.map((line, i) => ({
-      line, condition: bps.conditions[i] ?? null,
+      line, condition: bps.conditions[i] ?? null, verified: true,
     })));
     await this.syncBreakpointsToFile(file);
   }
@@ -432,7 +432,11 @@ export class DebugController {
     const resp = await this.client.request("setBreakpoints", bpArgs);
     if (!resp.success || !resp.body) return { success: false, verified: [] };
     const bps = (resp.body as { breakpoints?: Array<{ line?: number; verified?: boolean }> }).breakpoints || [];
-    return { success: true, verified: bps.map(b => b.verified ?? false) };
+    const verified = bps.map(b => b.verified ?? false);
+    for (let i = 0; i < list.length && i < verified.length; i++) {
+      list[i]!.verified = verified[i]!;
+    }
+    return { success: true, verified };
   }
 
   private async addBreakpoint(filePath: string, line: number, condition?: string): Promise<CommandResult> {
@@ -445,7 +449,7 @@ export class DebugController {
       list = [];
       this.breakpoints.set(absPath, list);
     }
-    list.push({ line, condition: condition ?? null });
+    list.push({ line, condition: condition ?? null, verified: false });
 
     const sync = await this.syncBreakpointsToFile(absPath);
     if (!sync.success) {
@@ -463,7 +467,7 @@ export class DebugController {
     const result: BreakpointInfo[] = [];
     for (const [file, list] of this.breakpoints) {
       for (const bp of list) {
-        result.push({ file, line: bp.line, verified: true, condition: bp.condition });
+        result.push({ file, line: bp.line, verified: bp.verified, condition: bp.condition });
       }
     }
     return { breakpoints: result, count: result.length };
@@ -486,15 +490,19 @@ export class DebugController {
   }
 
   private async clearBreakpoints(): Promise<CommandResult> {
-    let count = 0;
     const files = [...this.breakpoints.keys()];
+    let count = 0;
     for (const file of files) {
       count += this.breakpoints.get(file)!.length;
       this.breakpoints.set(file, []);
       await this.syncBreakpointsToFile(file);
-      if (this.onBreakpointsChanged) await this.onBreakpointsChanged(file);
     }
     this.breakpoints.clear();
+    if (this.onBreakpointsChanged) {
+      for (const file of files) {
+        await this.onBreakpointsChanged(file);
+      }
+    }
     return { status: "cleared", count };
   }
 

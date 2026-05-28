@@ -32,24 +32,12 @@
 
 ---
 
-## Low — listBreakpoints 硬编码 verified: true
+## ~~Low~~ ✅ 已修复 — listBreakpoints 硬编码 verified: true
 
-**文件**: `src/debug-controller.ts:458-466`
-
-**问题**: `listBreakpoints()` 返回的每个断点都设 `verified: true`，不追踪 DAP adapter 返回的实际验证状态。`addBreakpoint` 的 `syncBreakpointsToFile` 返回了 `verified[]` 但只在添加时使用，未持久化。
-
-**影响**: `break list` 可能显示 `verified` 但实际断点未生效。
-
-**修复**: 在 breakpoints map 中存储 `verified` 字段，`syncBreakpointsToFile` 后更新。
+**修复**: breakpoints map 增加 `verified` 字段，`syncBreakpointsToFile` 同步后更新实际验证状态。
 
 ---
 
-## Low — clearBreakpoints 广播时数据可能过期
+## ~~Low~~ ✅ 已修复 — clearBreakpoints 广播时数据可能过期
 
-**文件**: `src/debug-controller.ts:484-494`
-
-**问题**: `clearBreakpoints` 遍历文件列表，对每个文件调 `onBreakpointsChanged`。但循环中先 `this.breakpoints.set(file, [])` 再广播。广播回调 `broadcastBreakpoints` 读 `getCurrentBreakpoints()` 时，该文件可能已是空列表。最后 `this.breakpoints.clear()` 清空整个 map。
-
-**影响**: 子进程可能收到不完整的断点同步数据。但最终状态正确（所有断点都被清除）。
-
-**修复**: 先收集要广播的文件列表，再清空 map，最后统一广播空断点。
+**修复**: 先对每个文件同步空断点到 DAP，再 `clear()` map，最后统一广播 `onBreakpointsChanged`。
