@@ -5,6 +5,7 @@ import { resolve as pathResolve } from "node:path";
 import type { DAPClient } from "./dap-client.js";
 import type { AdapterConfig } from "./adapters/base.js";
 import type { Command, CommandResult, LocationInfo, ExceptionDetail, BreakpointInfo } from "./protocol.js";
+import { STOP_REASON, isExceptionReason } from "./protocol.js";
 import type { SessionState } from "./session.js";
 
 export class DebugController {
@@ -58,9 +59,9 @@ export class DebugController {
           this.state = "paused";
           const body = (stopped.body || {}) as { reason?: string; threadId?: number; text?: string; description?: string };
           this.threadId = body.threadId ?? this.threadId;
-          this.bgStopReason = body.reason === "exception" && body.text
+          this.bgStopReason = body.reason === STOP_REASON.EXCEPTION && body.text
             ? `${body.text}: ${body.description || ""}`.trim()
-            : (body.reason || "unknown");
+            : (body.reason || STOP_REASON.UNKNOWN);
           await this.updateFrame();
           if (this.bgExtraHandler) await this.bgExtraHandler();
           return;
@@ -408,7 +409,7 @@ export class DebugController {
         return {
           status: "paused",
           reason,
-          exception: reason !== "breakpoint" && reason !== "step" ? await this.fetchExceptionInfo() : null,
+          exception: isExceptionReason(reason) ? await this.fetchExceptionInfo() : null,
           location: await this.currentLocation(),
         };
       }
@@ -515,10 +516,10 @@ export class DebugController {
         const reason = this.bgStopReason;
         this.bgStopReason = null;
         const loc = await this.currentLocation();
-        const exception = reason !== "breakpoint" && reason !== "step" ? await this.fetchExceptionInfo() : null;
+        const exception = isExceptionReason(reason) ? await this.fetchExceptionInfo() : null;
         return {
           status: "paused",
-          reason: reason || "breakpoint",
+          reason: reason || STOP_REASON.BREAKPOINT,
           location: loc,
           exception,
         };
@@ -535,13 +536,13 @@ export class DebugController {
         this.threadId = body.threadId ?? this.threadId;
         await this.updateFrame();
         if (this.bgExtraHandler) await this.bgExtraHandler();
-        const detail = body.reason === "exception" && body.text
+        const detail = body.reason === STOP_REASON.EXCEPTION && body.text
           ? `${body.text}: ${body.description || ""}`.trim()
           : body.reason;
-        const exception = body.reason === "exception" ? await this.fetchExceptionInfo() : null;
+        const exception = body.reason === STOP_REASON.EXCEPTION ? await this.fetchExceptionInfo() : null;
         return {
           status: "paused",
-          reason: detail || "unknown",
+          reason: detail || STOP_REASON.UNKNOWN,
           location: await this.currentLocation(),
           exception,
         };

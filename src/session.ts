@@ -9,6 +9,7 @@ import { SubprocessSession } from "./subprocess-session.js";
 import { DebugController } from "./debug-controller.js";
 import { generateSessionId } from "./util/paths.js";
 import type { Command, CommandResult } from "./protocol.js";
+import { STOP_REASON, isExceptionReason } from "./protocol.js";
 
 export type SessionState = "idle" | "starting" | "running" | "paused" | "terminated";
 
@@ -140,7 +141,7 @@ export class Session {
       this.controller.setThreadId(body.threadId ?? 1);
       await this.controller.updateFrame();
       result.location = await this.controller.currentLocation();
-      if (result.reason && result.reason !== "breakpoint" && result.reason !== "step") {
+      if (isExceptionReason(result.reason)) {
         result.exception = await this.controller.fetchExceptionInfo();
       }
       // Drain any startDebugging reverse requests that arrived during init

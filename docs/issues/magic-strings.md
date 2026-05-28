@@ -16,31 +16,9 @@
 
 ## 需要改进的部分
 
-### 1. Stop Reason — 无集中定义 (高优先级)
+### 1. ~~Stop Reason — 无集中定义~~ ✅ 已修复
 
-散落在 `debug-controller.ts` 和 `session.ts` 中，约 8 处。
-
-| 字符串 | 使用位置 |
-|--------|---------|
-| `"breakpoint"` | debug-controller.ts (getStatusAsync, waitForStop), session.ts (startSession 条件判断) |
-| `"step"` | debug-controller.ts (getStatusAsync), session.ts |
-| `"exception"` | debug-controller.ts (bgLoop 解析 stopped body, waitForStop) |
-| `"unknown"` | debug-controller.ts (bgLoop fallback, waitForStop fallback) |
-
-**问题**: `getStatusAsync` 和 `waitForStop` 对 reason 的判断逻辑不一致（一个跳过 `"step"`，一个不跳过），正是因为缺少集中的 reason 定义和 helper 函数。
-
-**修复方向**: 在 `protocol.ts` 或 `debug-controller.ts` 顶部定义：
-
-```typescript
-const STOP_REASONS = {
-  BREAKPOINT: "breakpoint",
-  STEP: "step",
-  EXCEPTION: "exception",
-  UNKNOWN: "unknown",
-} as const;
-```
-
-并提取 `isExceptionReason(reason: string): boolean` helper 统一判断逻辑。
+**修复**: 在 `protocol.ts` 中定义 `STOP_REASON` 常量对象和 `isExceptionReason()` helper，`debug-controller.ts` 和 `session.ts` 全部使用常量引用。
 
 ### 2. Adapter/Language 名称 — 无集中定义 (中优先级)
 

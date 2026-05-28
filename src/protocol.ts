@@ -100,6 +100,22 @@ export const Command = z.discriminatedUnion("action", [
 
 export type Command = z.infer<typeof Command>;
 
+// --- Stop reasons (from DAP stopped events) ---
+
+export const STOP_REASON = {
+  BREAKPOINT: "breakpoint",
+  STEP: "step",
+  EXCEPTION: "exception",
+  UNKNOWN: "unknown",
+} as const;
+
+export type StopReason = (typeof STOP_REASON)[keyof typeof STOP_REASON];
+
+/** Whether a stop reason may carry exception details. */
+export function isExceptionReason(reason: string | null | undefined): boolean {
+  return reason !== STOP_REASON.BREAKPOINT && reason !== STOP_REASON.STEP && !!reason;
+}
+
 // --- Results (Daemon -> CLI) ---
 
 export interface LocationInfo {
