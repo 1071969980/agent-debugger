@@ -146,7 +146,7 @@ export class RustAdapter implements AdapterConfig {
       return { status: "terminated", message: "Program finished without hitting breakpoint" };
     }
 
-    return { status: "running", breakpoints: bpResults };
+    return { status: "running", message: "Program is running.", breakpoints: bpResults };
   }
 
   isInternalFrame(frame: StackFrame): boolean {

@@ -27,7 +27,8 @@ agent-debugger vars
 agent-debugger eval "type(data['age'])"
 
 # Continue to the next breakpoint
-agent-debugger continue
+agent-debugger continue        # non-blocking — returns immediately
+agent-debugger status          # check if paused at the next breakpoint
 
 # Done
 agent-debugger close
@@ -63,7 +64,8 @@ agent-debugger close          # detaches without killing the server
 | `vars` | List local variables in the current frame |
 | `eval <expression>` | Evaluate an expression in the current scope |
 | `step [into\|out]` | Step over, into a function, or out of a function |
-| `continue` | Resume execution (blocks until next stop) |
+| `continue` | Resume execution (non-blocking by default) |
+| `continue --wait` | Resume and block until next stop |
 | `stack` | Show the call stack |
 | `break add <file:line[:cond]>` | Add a breakpoint mid-session |
 | `break list` | List all breakpoints |
@@ -176,7 +178,8 @@ python -m debugpy --listen 5678 -m uvicorn app:main
 
 # Attach
 agent-debugger attach 5678 --break routes.py:42
-agent-debugger continue
+# ...exercise the code path, then check status...
+agent-debugger status
 ```
 
 Or embed debugpy in your code:

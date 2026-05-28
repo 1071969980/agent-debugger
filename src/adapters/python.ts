@@ -206,7 +206,7 @@ export class PythonAdapter implements AdapterConfig {
       return { status: "terminated", message: "Program finished without hitting breakpoint" };
     }
 
-    return { status: "running", breakpoints: bpResults };
+    return { status: "running", message: "Program is running.", breakpoints: bpResults };
   }
 
   /**
@@ -289,7 +289,7 @@ export class PythonAdapter implements AdapterConfig {
     }
 
     // Program is already running — don't wait for stopped event.
-    return { status: "running", breakpoints: bpResults };
+    return { status: "running", message: "Attached. Program is running.", breakpoints: bpResults };
   }
 
   /**

@@ -253,18 +253,20 @@ function formatResult(result: CommandResult): string {
     return out.join("\n");
   }
 
-  // Running (e.g. after attach — breakpoints set, waiting for trigger)
+  // Running (e.g. after attach, continue, step)
   if (result.status === "running") {
     const out: string[] = [];
     if (sessionId) out.push(`Session ID: ${sessionId}`);
-    out.push("Attached. Program is running.");
+    out.push(result.message || "Running.");
     if (result.breakpoints) {
       for (const bp of result.breakpoints) {
         const v = bp.verified ? "verified" : "pending";
         out.push(`  Breakpoint: ${bp.file}:${bp.line} (${v})`);
       }
     }
-    out.push("  Background monitoring active. Check state with 'agent-debugger status'.");
+    if (result.breakpoints) {
+      out.push("  Background monitoring active. Check state with 'agent-debugger status'.");
+    }
     return out.join("\n");
   }
 
@@ -298,7 +300,9 @@ Usage:
   agent-debugger vars                        Get local variables
   agent-debugger eval <expression>           Evaluate expression
   agent-debugger step [into|out]             Step over/into/out
-  agent-debugger continue                    Resume execution (blocks until next stop)
+  agent-debugger step [into|out] --wait      Step and block until next stop
+  agent-debugger continue                    Resume execution
+  agent-debugger continue --wait             Resume and block until next stop
   agent-debugger stack                       Show call stack
   agent-debugger break add <file:line[:cond]>  Add breakpoint
   agent-debugger break list                     List breakpoints
@@ -316,6 +320,9 @@ Session targeting:
                       Use <session_id>/<subprocess_id> to target a subprocess
                       When only one session exists, it is used automatically.
                       When multiple sessions exist, --session is required.
+
+Common options:
+  --wait, -w                       Block until next stop (continue/step)
 
 Start options:
   -b, --break <file:line[:cond]>  Set a breakpoint (repeatable)
@@ -539,9 +546,12 @@ async function main(): Promise<void> {
         }
         result = await sendCommand({ action: "eval", expression: expr }, sid);
       } else if (command === "step") {
-        result = await sendCommand({ action: "step", kind: args[1] || "over" }, sid);
+        const wait = args.includes("--wait") || args.includes("-w");
+        const kind = ["over", "into", "out"].includes(args[1] || "") ? args[1] : "over";
+        result = await sendCommand({ action: "step", kind, wait: wait || undefined }, sid);
       } else if (command === "continue" || command === "cont" || command === "c") {
-        result = await sendCommand({ action: "continue" }, sid);
+        const wait = args.includes("--wait") || args.includes("-w");
+        result = await sendCommand({ action: "continue", wait: wait || undefined }, sid);
       } else if (command === "break" || command === "bp") {
         const sub = args[1];
         if (!sub || sub.startsWith("-")) {

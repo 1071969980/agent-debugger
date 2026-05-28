@@ -48,9 +48,13 @@ export const EvalCommand = z.object({
 export const StepCommand = z.object({
   action: z.literal("step"),
   kind: z.enum(["over", "into", "out"]).optional(),
+  wait: z.boolean().optional(),
 });
 
-export const ContinueCommand = z.object({ action: z.literal("continue") });
+export const ContinueCommand = z.object({
+  action: z.literal("continue"),
+  wait: z.boolean().optional(),
+});
 
 export const BreakCommand = z.object({
   action: z.literal("break"),

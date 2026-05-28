@@ -54,7 +54,9 @@ agent-debugger attach [host:]port [--break file:line] [--catch [filter]]    # At
 agent-debugger eval <expression>        # Run any expression in the current frame
 agent-debugger vars                     # List local variables (prefer eval)
 agent-debugger step [into|out]          # Step over / into function / out of function
-agent-debugger continue                 # Resume execution (blocks until next stop)
+agent-debugger step [into|out] --wait   # Step and block until next stop
+agent-debugger continue                 # Resume execution (non-blocking)
+agent-debugger continue --wait          # Resume and block until next stop
 agent-debugger stack                    # Show call stack
 agent-debugger break add <file:line[:cond]>  # Add breakpoint mid-session
 agent-debugger break list                     # List all breakpoints
@@ -133,7 +135,7 @@ agent-debugger eval "request.body"
 agent-debugger close                    # detaches without killing the server
 
 # Or block until the next hit:
-agent-debugger continue                 # resumes and blocks until next stop
+agent-debugger continue --wait          # resumes and blocks until next stop
 
 # Script you need to run? Start.
 agent-debugger start app.py --break "app.py:25"
@@ -348,3 +350,4 @@ agent-debugger eval "users[2]"                           # {'name': 'Charlie', '
 - `attach --pid` requires lldb (macOS, included with Xcode CLI tools) or gdb (Linux)
 - Program stdout goes to the daemon — use `eval` to inspect output values
 - Use `list` to see all active sessions and their IDs
+- `continue` and `step` are non-blocking by default — use `status` to check if paused, or `--wait` to block

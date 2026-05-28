@@ -214,9 +214,9 @@ export class DebugController {
       case "eval":
         return this.evalExpression(cmd.expression);
       case "step":
-        return this.step(cmd.kind || "over");
+        return this.step(cmd.kind || "over", cmd.wait);
       case "continue":
-        return this.continueExecution();
+        return this.continueExecution(cmd.wait);
       case "break": {
         const breakCmd = cmd as Extract<Command, { action: "break" }>;
         switch (breakCmd.sub) {
@@ -320,7 +320,7 @@ export class DebugController {
     return { error: resp.message || "Evaluation failed" };
   }
 
-  private async step(kind: string): Promise<CommandResult> {
+  private async step(kind: string, wait?: boolean): Promise<CommandResult> {
     if (this.state !== "paused") return { error: "Not paused" };
     if (this.threadId === null) return { error: "No thread" };
 
@@ -331,12 +331,16 @@ export class DebugController {
     const command = kind === "into" ? "stepIn" : kind === "out" ? "stepOut" : "next";
     await this.client.request(command, { threadId: this.threadId });
     this.state = "running";
-    return this.waitForStop();
+
+    if (wait) return this.waitForStop();
+
+    this.startBgEventLoop();
+    return { status: "running", message: "Resumed." };
   }
 
-  private async continueExecution(): Promise<CommandResult> {
+  private async continueExecution(wait?: boolean): Promise<CommandResult> {
     if (this.state === "running") {
-      return this.waitForStop();
+      return wait ? this.waitForStop() : { status: "running", message: "Already running." };
     }
     if (this.state !== "paused") return { error: "Not paused" };
     if (this.threadId === null) return { error: "No thread" };
@@ -347,7 +351,11 @@ export class DebugController {
 
     await this.client.request("continue", { threadId: this.threadId });
     this.state = "running";
-    return this.waitForStop();
+
+    if (wait) return this.waitForStop();
+
+    this.startBgEventLoop();
+    return { status: "running", message: "Resumed." };
   }
 
   private async getSource(filePath?: string, line?: number): Promise<CommandResult> {
@@ -396,7 +404,7 @@ export class DebugController {
         return {
           status: "paused",
           reason,
-          exception: await this.fetchExceptionInfo(),
+          exception: reason !== "breakpoint" && reason !== "step" ? await this.fetchExceptionInfo() : null,
           location: await this.currentLocation(),
         };
       }
