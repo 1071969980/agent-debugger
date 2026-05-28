@@ -515,7 +515,7 @@ export class DebugController {
         const reason = this.bgStopReason;
         this.bgStopReason = null;
         const loc = await this.currentLocation();
-        const exception = reason !== "breakpoint" ? await this.fetchExceptionInfo() : null;
+        const exception = reason !== "breakpoint" && reason !== "step" ? await this.fetchExceptionInfo() : null;
         return {
           status: "paused",
           reason: reason || "breakpoint",

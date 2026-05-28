@@ -20,15 +20,9 @@
 
 ---
 
-## Low — getStatusAsync 与 waitForStop 的 exception 获取逻辑不一致
+## ~~Low~~ ✅ 已修复 — getStatusAsync 与 waitForStop 的 exception 获取逻辑不一致
 
-**文件**: `src/debug-controller.ts:407` vs `src/debug-controller.ts:506`
-
-**问题**: `getStatusAsync` 对 reason 为 `"breakpoint"` 或 `"step"` 时跳过 `fetchExceptionInfo()`。但 `waitForStop` 只跳过 `"breakpoint"`，不跳过 `"step"`。
-
-**影响**: 无实际 bug — step 停止时没有 exception 可取，`fetchExceptionInfo` 返回 null。但逻辑不一致可能导致后续维护混乱。
-
-**修复**: 统一两处逻辑，提取为 `isExceptionReason(reason)` helper。
+**修复**: 统一为仅当 reason 既非 `"breakpoint"` 也非 `"step"` 时才调用 `fetchExceptionInfo()`。
 
 ---
 
